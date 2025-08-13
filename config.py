@@ -1,5 +1,6 @@
 import torch
 
+
 class Config:
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
     DTYPE = torch.bfloat16
@@ -17,6 +18,6 @@ class Config:
     FOLD_EQUITY_MEAN = 0.4
     FOLD_EQUITY_STD = 0.3
     EQUITY_STD = 0.1
-    EQUITY_ROLLOUTS = 20 
+    EQUITY_ROLLOUTS = 40
     BLUFF_FACTOR = 0.3
-    FOLD_PENALTY = 0.5 
+    FOLD_PENALTY = 0.5
