@@ -1,8 +1,31 @@
+"""Abstraction helpers for clustering poker game states.
+
+The current implementation builds a simple bucket abstraction by running
+``k``-means on simulated equity feature vectors.  Alternative approaches such
+as effective hand strength (EHS/EHS2) or other potential-aware schemes could be
+plugged in, but are outside the scope of this reference implementation.
+
+Bucket counts are tracked per street to make it explicit how many clusters are
+used at each stage of the game.  Hands and boards are canonicalised before
+feature extraction so that permuting suits or card order does not change the
+resulting bucket, which helps avoid the "bucket bleed" problem.
+"""
+
 import numpy as np
 from sklearn.cluster import KMeans
 from game import simulate_equity_batch
 from config import Config
 import eval7
+
+
+# Number of abstraction buckets to use on each betting street.  These values are
+# purely illustrative and can be tuned depending on the desired granularity.
+BUCKETS_PER_STREET = {
+    "preflop": 169,  # canonical starting hands
+    "flop": 1000,
+    "turn": 500,
+    "river": 200,
+}
 
 def simulate_features(num_sims=Config.NUM_SIMS):
     batches = (num_sims + Config.BATCH_SIZE - 1) // Config.BATCH_SIZE
@@ -34,3 +57,4 @@ if __name__ == "__main__":
     np.save('buckets.npy', buckets)
     np.save('centroids.npy', centroids)
     print(f"Buckets created: {len(set(buckets))} unique")
+
