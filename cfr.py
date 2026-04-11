@@ -12,11 +12,36 @@ nodes = defaultdict(lambda: {
     'strategy_sum': torch.zeros(Config.NUM_ACTIONS, device=Config.DEVICE, dtype=Config.DTYPE)
 })
 
-def get_strategy(regret_sum):
-    regret_sum = torch.clamp(regret_sum, min=0)
-    norm = regret_sum.sum()
-    return regret_sum / norm if norm > 0 else torch.full((Config.NUM_ACTIONS,), 1.0 / Config.NUM_ACTIONS, device=Config.DEVICE, dtype=Config.DTYPE)
+def _regret_matching_core(regret_sum):
+    # Compile-friendly regret matching keeps this hot tensor path fast on ROCm.
+    positive_regret = torch.clamp(regret_sum, min=0)
+    normalizer = positive_regret.sum()
+    uniform_strategy = torch.full_like(positive_regret, 1.0 / Config.NUM_ACTIONS)
+    safe_normalizer = torch.clamp(normalizer, min=torch.finfo(positive_regret.dtype).eps)
+    normalized_strategy = positive_regret / safe_normalizer
+    return torch.where(normalizer > 0, normalized_strategy, uniform_strategy)
 
+
+try:
+    # Compile the frequent regret-matching kernel for the 7900XT tensor path.
+    _REGRET_MATCHING_IMPL = torch.compile(_regret_matching_core, mode='max-autotune', fullgraph=False) if torch.cuda.is_available() else _regret_matching_core
+except Exception:
+    _REGRET_MATCHING_IMPL = _regret_matching_core
+
+
+def get_strategy(regret_sum):
+    # Route regret matching through the compiled helper to reduce per-node overhead.
+    return _REGRET_MATCHING_IMPL(regret_sum)
+
+
+@torch.no_grad()
+def apply_regret_matching_boost(regret_sum, strategy_sum, weight):
+    # Periodically blend average strategy toward regret matching for lightweight stabilization.
+    boosted_strategy = get_strategy(regret_sum)
+    return strategy_sum.lerp(boosted_strategy, weight)
+
+
+@torch.no_grad()
 def mccfr(infoset: Infoset, iteration, prob=1.0, actor=None, depth=0, max_depth=3, player=0):
     if terminal(infoset) or depth >= max_depth:
         return simulate_action(infoset, None) + np.random.normal(0, 0.1)
@@ -71,6 +96,8 @@ def mccfr(infoset: Infoset, iteration, prob=1.0, actor=None, depth=0, max_depth=
     
     return util
 
+
+@torch.no_grad()
 def average_strategy(infoset: Infoset, actor=None):
     key = infoset.key
     if actor is not None:

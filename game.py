@@ -1,8 +1,39 @@
+import atexit
+import numpy as np
 import torch
 from datatypes import Action
 from config import Config
 import eval7
 import multiprocessing as mp
+
+_HAND_RANK_POOL = None
+
+
+def _shutdown_hand_rank_pool():
+    global _HAND_RANK_POOL
+    if _HAND_RANK_POOL is not None:
+        _HAND_RANK_POOL.close()
+        _HAND_RANK_POOL.join()
+        _HAND_RANK_POOL = None
+
+
+atexit.register(_shutdown_hand_rank_pool)
+
+
+def _get_hand_rank_pool():
+    global _HAND_RANK_POOL
+    if _HAND_RANK_POOL is None:
+        # Reuse one forkserver pool per process to avoid re-spawning workers every batch.
+        _HAND_RANK_POOL = mp.get_context('forkserver').Pool(processes=Config.MP_PROCESSES)
+    return _HAND_RANK_POOL
+
+
+def _card_to_id(card):
+    # Support both eval7 cards and lightweight project card objects with suit enums.
+    rank = getattr(card, 'rank', getattr(card, 'value', 2) - 2)
+    suit = getattr(card, 'suit', 0)
+    suit_value = getattr(suit, 'value', suit)
+    return int(rank) * 4 + int(suit_value)
 
 def evaluate_hand(cards_ids):
     ranks_str = '23456789TJQKA'
@@ -16,10 +47,9 @@ def evaluate_hand(cards_ids):
     return eval7.evaluate(cards)
 
 def hand_rank_tensor(hands):  # hands: (batch, 7) tensor of card ints (int64)
-    batch_size = hands.shape[0]
     hands_list = hands.cpu().numpy().tolist()  # Move to CPU list for multiprocessing
-    with mp.Pool(processes=24) as pool:  # Use all 24 threads on 7900X
-        ranks = pool.map(evaluate_hand, hands_list)
+    pool = _get_hand_rank_pool()
+    ranks = pool.map(evaluate_hand, hands_list)
     return torch.tensor(ranks, dtype=torch.int32, device=Config.DEVICE)
 
 def simulate_equity_batch(holes, boards, num_opponents=Config.NUM_OPPONENTS):
@@ -28,15 +58,15 @@ def simulate_equity_batch(holes, boards, num_opponents=Config.NUM_OPPONENTS):
     batch_size = min(Config.BATCH_SIZE, num_hands)
     for start in range(0, num_hands, batch_size):
         end = min(start + batch_size, num_hands)
-        batch_holes = torch.tensor([[c.rank * 4 + c.suit for c in h] for h in holes[start:end]], dtype=torch.int64, device=Config.DEVICE)
-        batch_boards = torch.tensor([[c.rank * 4 + c.suit for c in b] for b in boards[start:end]], dtype=torch.int64, device=Config.DEVICE)
+        batch_holes = torch.tensor([[_card_to_id(c) for c in h] for h in holes[start:end]], dtype=torch.int64, device=Config.DEVICE)
+        batch_boards = torch.tensor([[_card_to_id(c) for c in b] for b in boards[start:end]], dtype=torch.int64, device=Config.DEVICE)
         # Deck: remove used cards
         full_deck = torch.arange(52, dtype=torch.int64, device=Config.DEVICE).unsqueeze(0).repeat(end-start, 1)
         used = torch.cat((batch_holes, batch_boards), dim=1)
         mask = torch.zeros((end-start, 52), device=Config.DEVICE).scatter_(1, used, 1).bool()
         remaining = full_deck[~mask].reshape(end-start, -1)
-        # Rollout loop for more accurate equity
-        num_rollouts = 100  # Tune based on time; ~10-20x slower but better accuracy
+        # Pull the rollout budget from Config so training can throttle under memory pressure.
+        num_rollouts = Config.EQUITY_ROLLOUTS
         rollout_wins = torch.zeros((end-start, num_rollouts), device=Config.DEVICE)
         for r in range(num_rollouts):
             perm = torch.randperm(remaining.shape[1], device=Config.DEVICE).repeat(end-start, 1)

@@ -1,0 +1,21 @@
+# Python cache artifacts
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+
+# TensorBoard and training run outputs
+runs/
+events.out.tfevents.*
+
+# Model checkpoints and generated strategy dumps
+*.pth
+*.pt
+*.ckpt
+partial_strategies.npy
+strategies.npy
+
+# Local logs
+*.log

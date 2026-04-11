@@ -1,0 +1,11 @@
+# Core dependencies for Poker2
+# Note: Install PyTorch per https://pytorch.org for the correct CUDA/CPU wheel if needed.
+# If you want a CPU-only install, consider: pip install "torch==2.2.0+cpu" -f https://download.pytorch.org/whl/torch_stable.html
+
+torch
+numpy
+ray
+eval7
+psutil
+tensorboard
+scikit-learn
