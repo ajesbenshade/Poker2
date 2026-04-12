@@ -86,7 +86,7 @@ class DeepCFRAgent:
         self.infosets = list(infosets)
         self.bucket_centroids = np.asarray(bucket_centroids, dtype=np.float32)
         self.autocast_device = 'cuda' if self.device == 'cuda' else 'cpu'
-        self.amp_enabled = self.device == 'cuda'
+        self.amp_enabled = self.device == 'cuda' and Config.AMP_ENABLED
         self.current_batch_size = Config.BATCH_SIZE
         self.current_num_traversals = Config.NUM_TRAVERSALS
         self.current_rollouts = Config.EQUITY_ROLLOUTS
@@ -194,7 +194,7 @@ class DeepCFRAgent:
 
     def _sample_actions(self, strategy):
         strategy = self._normalize_strategy(strategy)
-        return torch.multinomial(strategy, num_samples=1).squeeze(-1).cpu().numpy()
+        return torch.multinomial(strategy, num_samples=1).squeeze(-1).cpu().float().numpy()
 
     def _compute_action_utilities(self, infosets):
         repeated_infosets = []
@@ -342,11 +342,11 @@ class DeepCFRAgent:
             exploitability = self._sanitize_tensor(exploitability, 'exploitability', clamp_value=Config.UTILITY_CLAMP)
 
             importance_weights = np.full(len(active_infosets), 1.0, dtype=np.float32)
-            advantage_examples += self.advantage_buffer.add_batch(encoded_features, regrets.detach().cpu().numpy(), importance_weights)
-            strategy_examples += self.strategy_buffer.add_batch(encoded_features, strategy.detach().cpu().numpy(), importance_weights)
+            advantage_examples += self.advantage_buffer.add_batch(encoded_features, regrets.detach().cpu().float().numpy(), importance_weights)
+            strategy_examples += self.strategy_buffer.add_batch(encoded_features, strategy.detach().cpu().float().numpy(), importance_weights)
 
-            utility_values.extend(expected_utility.squeeze(-1).detach().cpu().numpy().tolist())
-            exploitability_values.extend(exploitability.detach().cpu().numpy().tolist())
+            utility_values.extend(expected_utility.squeeze(-1).detach().cpu().float().numpy().tolist())
+            exploitability_values.extend(exploitability.detach().cpu().float().numpy().tolist())
 
             chosen_actions = self._sample_actions(strategy)
             next_infosets = []

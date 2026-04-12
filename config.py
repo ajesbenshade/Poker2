@@ -7,6 +7,8 @@ setup_rocmo()
 import torch
 import torch.nn as nn
 
+torch.set_default_dtype(torch.float32)
+
 
 class EquityNet(nn.Module):
     # Lightweight MLP used by the CFR pipeline and the standalone equity trainer.
@@ -28,24 +30,28 @@ class Config:
     SAFE_HARDWARE_MODE = True
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
     DTYPE = torch.float32
+    NN_DTYPE = torch.float32
     BUFFER_DTYPE = torch.float16
-    AMP_DTYPE = torch.bfloat16 if DEVICE == 'cuda' else torch.float32
-    NUM_BUCKETS = 4096
+    AMP_ENABLED = False
+    AMP_DTYPE = torch.float32
+    NUM_BUCKETS = 2048
     NUM_SIMULATIONS = 65536
     NUM_SIMS = NUM_SIMULATIONS
-    ITERATIONS = 100000
+    ITERATIONS = 5000
     SAMPLING_RATE = 0.5
     DISCOUNT = 0.99
     NUM_ACTIONS = 3
     NUM_OPPONENTS = 1
-    BATCH_SIZE = 4096
+    BATCH_SIZE = 2048
     MAX_BATCH_SIZE = 8192
     MIN_BATCH_SIZE = 512
-    MODEL_HIDDEN_DIM = 1536 if SAFE_HARDWARE_MODE else 2048
+    NN_HIDDEN_SIZE = 1024
+    MODEL_HIDDEN_DIM = NN_HIDDEN_SIZE
     MODEL_DEPTH = 4
     MODEL_DROPOUT = 0.0
     DEEP_CFR_FEATURE_DIM = 16
-    NUM_TRAVERSALS = 2048
+    DEEP_CFR_TRAVERSALS_PER_ITER = 512
+    NUM_TRAVERSALS = DEEP_CFR_TRAVERSALS_PER_ITER
     MAX_NUM_TRAVERSALS = 4096
     MIN_NUM_TRAVERSALS = 128
     ADVANTAGE_TRAIN_STEPS = 4
