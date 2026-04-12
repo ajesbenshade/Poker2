@@ -54,10 +54,10 @@ class Config:
     BLUFF_FACTOR = 0.3
     FOLD_PENALTY = 0.5
 
-    # Keep Ray slightly below the full 24-thread count to avoid CPU oversubscription.
-    RAY_NUM_CPUS = min(24, max(20, os.cpu_count() or 24))
-    RAY_WORKER_LIMIT = min(20, RAY_NUM_CPUS)
-    RAY_TASK_BATCH = 1024
+    # Cap Ray around 22 workers so the 7900X still has headroom for ROCm/runtime threads.
+    RAY_NUM_CPUS = min(22, max(20, os.cpu_count() or 24))
+    RAY_WORKER_LIMIT = min(22, RAY_NUM_CPUS)
+    RAY_TASK_BATCH = 256
     MIN_RAY_TASK_BATCH = 128
 
     # Reuse a capped multiprocessing pool inside equity evaluation to stay cache-friendly.
@@ -73,10 +73,20 @@ class Config:
     VRAM_SOFT_LIMIT_GB = 16.0
     RAM_SOFT_LIMIT_PCT = 80.0
     LOG_INTERVAL = 250
+    MIN_EQUITY_ROLLOUTS = 8
+
+    # Save periodic recovery checkpoints so long runs can resume from recent strategy snapshots.
+    CHECKPOINT_INTERVAL = 1000
+    CHECKPOINT_DIR = 'checkpoints'
 
     # Lightweight hybrid regret boost cadence for periodic strategy stabilization.
     HYBRID_UPDATE_INTERVAL = 25000
     HYBRID_BOOST_WEIGHT = 0.05
+
+    # Allow small smoke-test runs without editing source files.
+    TEST_ITERATIONS = 1
+    TEST_NUM_SIMS = 128
+    TEST_NUM_BUCKETS = 32
 
     # Optional future disk-backed table storage for large regret tables under 64 GB RAM.
     USE_LMDB_TABLES = False

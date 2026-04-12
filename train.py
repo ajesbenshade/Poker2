@@ -1,6 +1,7 @@
 infosets = None
 actor = None
 
+import argparse
 import os
 import signal
 import sys
@@ -52,6 +53,43 @@ def maybe_compile_models():
             logger.warning(f'Falling back to eager EquityNet execution: {compile_error}')
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description='Train the CFR solver with ROCm-aware runtime controls.')
+    parser.add_argument('--iterations', type=int, default=Config.ITERATIONS)
+    parser.add_argument('--num-sims', type=int, default=Config.NUM_SIMS)
+    parser.add_argument('--num-buckets', type=int, default=Config.NUM_BUCKETS)
+    parser.add_argument('--batch-size', type=int, default=Config.BATCH_SIZE)
+    parser.add_argument('--task-batch', type=int, default=Config.RAY_TASK_BATCH)
+    parser.add_argument('--log-interval', type=int, default=Config.LOG_INTERVAL)
+    parser.add_argument('--checkpoint-interval', type=int, default=Config.CHECKPOINT_INTERVAL)
+    parser.add_argument('--test-run', action='store_true', help='Run a small smoke-test configuration.')
+    return parser.parse_args()
+
+
+def apply_runtime_overrides(args):
+    if args.test_run:
+        # Small-run overrides make it easy to verify the full pipeline on the target machine.
+        Config.ITERATIONS = Config.TEST_ITERATIONS
+        Config.NUM_SIMS = Config.TEST_NUM_SIMS
+        Config.NUM_SIMULATIONS = Config.TEST_NUM_SIMS
+        Config.NUM_BUCKETS = Config.TEST_NUM_BUCKETS
+        Config.BATCH_SIZE = min(args.batch_size, 256)
+        Config.RAY_TASK_BATCH = min(args.task_batch, 32)
+        Config.LOG_INTERVAL = min(args.log_interval, 1)
+        Config.CHECKPOINT_INTERVAL = min(args.checkpoint_interval, 2)
+        Config.EQUITY_ROLLOUTS = min(Config.EQUITY_ROLLOUTS, 4)
+        Config.MP_PROCESSES = min(Config.MP_PROCESSES, 4)
+    else:
+        Config.ITERATIONS = args.iterations
+        Config.NUM_SIMS = args.num_sims
+        Config.NUM_SIMULATIONS = args.num_sims
+        Config.NUM_BUCKETS = args.num_buckets
+        Config.BATCH_SIZE = args.batch_size
+        Config.RAY_TASK_BATCH = args.task_batch
+        Config.LOG_INTERVAL = args.log_interval
+        Config.CHECKPOINT_INTERVAL = args.checkpoint_interval
+
+
 def init_ray():
     if not ray.is_initialized():
         # Limit Ray CPU slots so the nested equity-evaluation pool does not oversubscribe the 7900X.
@@ -93,6 +131,23 @@ def save_strategies(output_path):
     np.save(output_path, strategies)
 
 
+def save_checkpoint(iteration):
+    if actor is None or infosets is None:
+        return
+
+    # Checkpoint strategy snapshots periodically so long training runs can recover cleanly.
+    os.makedirs(Config.CHECKPOINT_DIR, exist_ok=True)
+    strategies = {}
+    for infoset in infosets:
+        strategy_sum = ray.get(actor.get_strategy_sum.remote(infoset.key))
+        if strategy_sum.sum() > 0:
+            strategies[infoset.key] = average_strategy(infoset, actor=actor).cpu().tolist()
+    checkpoint_path = os.path.join(Config.CHECKPOINT_DIR, f'cfr_checkpoint_iter_{iteration:07d}.pt')
+    torch.save({'iteration': iteration, 'strategies': strategies}, checkpoint_path)
+    torch.save({'iteration': iteration, 'strategies': strategies}, os.path.join(Config.CHECKPOINT_DIR, 'cfr_checkpoint_latest.pt'))
+    logger.info(f'Saved checkpoint to {checkpoint_path}')
+
+
 def sigterm_handler(signum, frame):
     logger.error('SIGTERM received; saving partial strategies and exiting.')
     save_strategies('partial_strategies.npy')
@@ -102,7 +157,7 @@ def sigterm_handler(signum, frame):
 signal.signal(signal.SIGTERM, sigterm_handler)
 
 
-@ray.remote
+@ray.remote(num_cpus=0)
 class NodesActor:
     def __init__(self):
         self.nodes = defaultdict(lambda: {
@@ -145,7 +200,7 @@ def train():
     maybe_compile_models()
 
     features = simulate_features()
-    buckets, _ = create_buckets(features)
+    buckets, _ = create_buckets(features, num_buckets=Config.NUM_BUCKETS)
     unique_buckets = np.unique(buckets)
     infosets = [Infoset(bid) for bid in unique_buckets]
     actor = NodesActor.remote()
@@ -164,8 +219,9 @@ def train():
         logger.error(f'Actor initialization failed: {error}')
         raise
 
-    current_task_batch = Config.RAY_TASK_BATCH
+    current_task_batch = min(Config.RAY_TASK_BATCH, Config.RAY_WORKER_LIMIT * 2)
     current_batch_size = Config.BATCH_SIZE
+    current_rollouts = Config.EQUITY_ROLLOUTS
 
     try:
         for it in range(Config.ITERATIONS):
@@ -195,25 +251,30 @@ def train():
                 if vram_gb > Config.VRAM_SOFT_LIMIT_GB or ram_pct > Config.RAM_SOFT_LIMIT_PCT:
                     current_task_batch = max(Config.MIN_RAY_TASK_BATCH, current_task_batch // 2)
                     current_batch_size = max(Config.MIN_BATCH_SIZE, current_batch_size // 2)
+                    current_rollouts = max(Config.MIN_EQUITY_ROLLOUTS, current_rollouts // 2)
                     Config.BATCH_SIZE = current_batch_size
+                    Config.EQUITY_ROLLOUTS = current_rollouts
                     logger.warning(
-                        f'Memory pressure detected; reducing task batch to {current_task_batch} and BATCH_SIZE to {current_batch_size}.'
+                        f'Memory pressure detected; reducing task batch to {current_task_batch}, BATCH_SIZE to {current_batch_size}, and rollout budget to {current_rollouts}.'
                     )
                 elif current_task_batch < Config.RAY_TASK_BATCH and vram_gb < (Config.VRAM_SOFT_LIMIT_GB * 0.75) and ram_pct < (Config.RAM_SOFT_LIMIT_PCT - 10.0):
                     current_task_batch = min(Config.RAY_TASK_BATCH, current_task_batch * 2)
                     current_batch_size = min(Config.MAX_BATCH_SIZE, current_batch_size * 2)
+                    current_rollouts = min(64, current_rollouts * 2)
                     Config.BATCH_SIZE = current_batch_size
+                    Config.EQUITY_ROLLOUTS = current_rollouts
 
                 writer.add_scalar('Util/Avg', total_util, it)
                 writer.add_scalar('Regret/Avg', avg_regret, it)
                 writer.add_scalar('System/VRAM_GB', vram_gb, it)
                 writer.add_scalar('System/RAM_Pct', ram_pct, it)
+                writer.add_scalar('System/EquityRollouts', current_rollouts, it)
                 writer.add_scalar('Curriculum/MaxDepth', current_max_depth, it)
                 writer.add_scalar('Curriculum/NumOpponents', current_num_opponents, it)
                 log_msg = (
                     f'Iter {it}: Util {total_util:.4f}, Regret {avg_regret:.6f} | '
                     f'VRAM {vram_gb:.2f} GB | RAM {ram_pct:.1f}% | '
-                    f'Depth {current_max_depth} | Opponents {current_num_opponents} | Chunk {current_task_batch}'
+                    f'Depth {current_max_depth} | Opponents {current_num_opponents} | Chunk {current_task_batch} | Rollouts {current_rollouts}'
                 )
                 logger.info(log_msg)
                 print(log_msg)
@@ -226,6 +287,10 @@ def train():
                 logger.info('Applying lightweight regret-matching boost across nodes...')
                 ray.get(actor.apply_regret_matching_boost.remote(Config.HYBRID_BOOST_WEIGHT))
 
+            if it > 0 and it % Config.CHECKPOINT_INTERVAL == 0:
+                # Save periodic recovery checkpoints for unattended training runs.
+                save_checkpoint(it)
+
     except KeyboardInterrupt:
         local_sigterm_handler(None, None)
     finally:
@@ -235,6 +300,8 @@ def train():
 
 
 if __name__ == '__main__':
+    runtime_args = parse_args()
+    apply_runtime_overrides(runtime_args)
     torch.set_default_dtype(Config.DTYPE)
     train()
     writer.close()

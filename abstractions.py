@@ -25,6 +25,8 @@ def simulate_features(num_sims=Config.NUM_SIMS):
     return features
 
 def create_buckets(features, num_buckets=Config.NUM_BUCKETS):
+    # Cap clusters to sample count so quick smoke tests with fewer simulations still run.
+    num_buckets = min(num_buckets, len(features))
     kmeans = KMeans(n_clusters=num_buckets, random_state=42).fit(features)
     return kmeans.labels_, kmeans.cluster_centers_
 
