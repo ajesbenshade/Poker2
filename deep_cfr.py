@@ -368,8 +368,10 @@ class DeepCFRAgent:
 
     def _log_metrics(self, iteration, metrics, snapshot):
         backoff_label = self.last_backoff_reason if self.iteration == self.last_backoff_iteration else 'none'
+        max_depth = metrics.get('max_depth', Config.MAX_CFR_DEPTH)
         log_message = (
             f'Iter {iteration} | avg_utility {metrics["avg_utility"]:.4f} | exploitability {metrics["exploitability_proxy"]:.4f} | '
+            f'depth {max_depth} | '
             f'vram {snapshot["used_pct"]:.1f}% ({snapshot["used_gb"]:.2f}/{snapshot["total_gb"]:.2f} GB) | '
             f'ram {snapshot["ram_pct"]:.1f}% | batch {self.current_batch_size} | traversals {self.current_num_traversals} | '
             f'rollouts {self.current_rollouts} | adv_buffer {len(self.advantage_buffer):,} | strat_buffer {len(self.strategy_buffer):,} | '
@@ -390,6 +392,7 @@ class DeepCFRAgent:
             self.writer.add_scalar('DeepCFR/AdvantageGradNorm', metrics['advantage_grad_norm'], iteration)
         if metrics.get('strategy_grad_norm') is not None:
             self.writer.add_scalar('DeepCFR/StrategyGradNorm', metrics['strategy_grad_norm'], iteration)
+        self.writer.add_scalar('DeepCFR/MaxDepth', max_depth, iteration)
         self.writer.add_scalar('DeepCFR/BatchSize', self.current_batch_size, iteration)
         self.writer.add_scalar('DeepCFR/Traversals', self.current_num_traversals, iteration)
         self.writer.add_scalar('DeepCFR/BackoffEvents', self.backoff_events, iteration)
@@ -467,6 +470,7 @@ class DeepCFRAgent:
             self.iteration = iteration
             max_depth = min(Config.MAX_CFR_DEPTH, Config.START_MAX_DEPTH + (iteration // Config.CURRICULUM_INTERVAL))
             iteration_metrics = self._run_traversals(max_depth=max_depth)
+            iteration_metrics['max_depth'] = max_depth
             advantage_loss, advantage_grad_norm = self._train_network(
                 self.advantage_net,
                 self.advantage_optimizer,

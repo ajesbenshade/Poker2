@@ -13,7 +13,7 @@ from collections import defaultdict
 
 os.environ.setdefault('OMP_NUM_THREADS', '1')
 
-from environment import clear_runtime_caches, get_memory_snapshot, setup_rocmo
+from environment import ROCM_ENV_DEFAULTS, clear_runtime_caches, get_memory_snapshot, setup_rocmo
 
 setup_rocmo()
 
@@ -58,6 +58,7 @@ def parse_args():
     parser.add_argument('--batch-size', type=int, default=None)
     parser.add_argument('--task-batch', type=int, default=None)
     parser.add_argument('--traversals', type=int, default=None)
+    parser.add_argument('--max-depth', type=int, default=None, help='Pin CFR traversal depth for this run.')
     parser.add_argument('--log-interval', type=int, default=None)
     parser.add_argument('--checkpoint-interval', type=int, default=None)
     return parser.parse_args()
@@ -102,6 +103,11 @@ def apply_runtime_profile(args):
         Config.LOG_INTERVAL = args.log_interval
     if args.checkpoint_interval is not None:
         Config.CHECKPOINT_INTERVAL = args.checkpoint_interval
+    if args.max_depth is not None:
+        if args.max_depth < 1:
+            raise ValueError('--max-depth must be at least 1.')
+        Config.START_MAX_DEPTH = args.max_depth
+        Config.MAX_CFR_DEPTH = args.max_depth
 
 
 def get_abstraction_cache_paths():
@@ -173,10 +179,13 @@ def init_ray():
         ignore_reinit_error=True,
         runtime_env={
             'env_vars': {
-                'HIP_VISIBLE_DEVICES': os.environ.get('HIP_VISIBLE_DEVICES', '0'),
-                'PYTORCH_HIP_ALLOC_CONF': os.environ.get('PYTORCH_HIP_ALLOC_CONF', ''),
-                'HSA_OVERRIDE_GFX_VERSION': os.environ.get('HSA_OVERRIDE_GFX_VERSION', '11.0.0'),
-                'PYTORCH_NO_ROCM_EXPANDABLE_SEGMENTS_WARNING': os.environ.get('PYTORCH_NO_ROCM_EXPANDABLE_SEGMENTS_WARNING', '1'),
+                'HIP_VISIBLE_DEVICES': os.environ.get('HIP_VISIBLE_DEVICES', ROCM_ENV_DEFAULTS['HIP_VISIBLE_DEVICES']),
+                'PYTORCH_HIP_ALLOC_CONF': os.environ.get('PYTORCH_HIP_ALLOC_CONF', ROCM_ENV_DEFAULTS['PYTORCH_HIP_ALLOC_CONF']),
+                'HSA_OVERRIDE_GFX_VERSION': os.environ.get('HSA_OVERRIDE_GFX_VERSION', ROCM_ENV_DEFAULTS['HSA_OVERRIDE_GFX_VERSION']),
+                'PYTORCH_NO_ROCM_EXPANDABLE_SEGMENTS_WARNING': os.environ.get(
+                    'PYTORCH_NO_ROCM_EXPANDABLE_SEGMENTS_WARNING',
+                    ROCM_ENV_DEFAULTS['PYTORCH_NO_ROCM_EXPANDABLE_SEGMENTS_WARNING'],
+                ),
                 'OMP_NUM_THREADS': os.environ.get('OMP_NUM_THREADS', '1'),
             }
         },
@@ -279,7 +288,12 @@ def train_mccfr():
     backoff_events = 0
     last_backoff_iteration = -Config.BACKOFF_COOLDOWN
 
-    logger.info('Starting MCCFR fallback with %s infosets', len(infosets))
+    logger.info(
+        'Starting MCCFR fallback with %s infosets | start_depth=%s | max_depth=%s',
+        len(infosets),
+        Config.START_MAX_DEPTH,
+        Config.MAX_CFR_DEPTH,
+    )
 
     avg_utility = 0.0
     avg_regret = 0.0
@@ -328,14 +342,16 @@ def train_mccfr():
             writer.add_scalar('MCCFR/AvgRegret', avg_regret, iteration)
             writer.add_scalar('MCCFR/ExploitabilityProxy', exploitability_proxy, iteration)
             writer.add_scalar('MCCFR/BatchSize', current_batch_size, iteration)
+            writer.add_scalar('MCCFR/MaxDepth', current_max_depth, iteration)
             writer.add_scalar('MCCFR/BackoffEvents', backoff_events, iteration)
             writer.add_scalar('System/VRAMPct', snapshot['used_pct'], iteration)
             writer.add_scalar('System/RAMPct', snapshot['ram_pct'], iteration)
             logger.info(
-                'Iter %s | avg_utility %.4f | exploitability %.4f | vram %.1f%% (%.2f/%.2f GB) | ram %.1f%% | batch %s | backoff %s',
+                'Iter %s | avg_utility %.4f | exploitability %.4f | depth %s | vram %.1f%% (%.2f/%.2f GB) | ram %.1f%% | batch %s | backoff %s',
                 iteration,
                 avg_utility,
                 exploitability_proxy,
+                current_max_depth,
                 snapshot['used_pct'],
                 snapshot['used_gb'],
                 snapshot['total_gb'],
@@ -380,11 +396,13 @@ def train_deep_cfr(args):
         start_iteration = active_agent.load_checkpoint_state(checkpoint_state, resolved_resume_path)
 
     logger.info(
-        'Starting Deep CFR with %s infosets | iterations=%s | batch=%s | traversals=%s | safe_mode=%s',
+        'Starting Deep CFR with %s infosets | iterations=%s | batch=%s | traversals=%s | start_depth=%s | max_depth=%s | safe_mode=%s',
         len(infosets),
         Config.ITERATIONS,
         Config.BATCH_SIZE,
         Config.NUM_TRAVERSALS,
+        Config.START_MAX_DEPTH,
+        Config.MAX_CFR_DEPTH,
         Config.SAFE_HARDWARE_MODE,
     )
     return active_agent.train(iterations=Config.ITERATIONS, start_iteration=start_iteration)
@@ -398,13 +416,20 @@ def main():
     writer = SummaryWriter()
     initial_snapshot = get_memory_snapshot()
     logger.info(
-        'Launcher mode=%s | smoke_test=%s | long_run=%s | vram=%.2f/%.2f GB | ram=%.1f%%',
+        'Launcher mode=%s | smoke_test=%s | long_run=%s | max_depth=%s | vram=%.2f/%.2f GB | ram=%.1f%%',
         args.mode,
         args.smoke_test,
         args.long_run,
+        args.max_depth,
         initial_snapshot['used_gb'],
         initial_snapshot['total_gb'],
         initial_snapshot['ram_pct'],
+    )
+    logger.info(
+        'ROCm env | hip_visible_devices=%s | hsa_override=%s | hip_alloc_conf=%s',
+        os.environ.get('HIP_VISIBLE_DEVICES', ROCM_ENV_DEFAULTS['HIP_VISIBLE_DEVICES']),
+        os.environ.get('HSA_OVERRIDE_GFX_VERSION', ROCM_ENV_DEFAULTS['HSA_OVERRIDE_GFX_VERSION']),
+        os.environ.get('PYTORCH_HIP_ALLOC_CONF', ROCM_ENV_DEFAULTS['PYTORCH_HIP_ALLOC_CONF']),
     )
 
     try:

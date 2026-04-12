@@ -6,8 +6,8 @@ import psutil
 
 ROCM_ENV_DEFAULTS = {
     'HIP_VISIBLE_DEVICES': '0',
-    'HSA_OVERRIDE_GFX_VERSION': '11.0.0',
-    'PYTORCH_HIP_ALLOC_CONF': 'garbage_collection_threshold:0.8,max_split_size_mb:256',
+    'HSA_OVERRIDE_GFX_VERSION': '11_0_0',
+    'PYTORCH_HIP_ALLOC_CONF': 'garbage_collection_threshold:0.8,expandable_segments:True',
     'PYTORCH_NO_ROCM_EXPANDABLE_SEGMENTS_WARNING': '1',
 }
 
