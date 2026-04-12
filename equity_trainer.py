@@ -2,10 +2,9 @@ import argparse
 import os
 import time
 
-# Mirror the main training environment so ROCm workers see the same allocator settings.
-os.environ.setdefault('HIP_VISIBLE_DEVICES', '0')
-os.environ.setdefault('PYTORCH_HIP_ALLOC_CONF', 'garbage_collection_threshold:0.8,max_split_size_mb:256')
-os.environ.setdefault('HSA_OVERRIDE_GFX_VERSION', '11.0.0')
+from environment import setup_rocmo
+
+setup_rocmo()
 
 import eval7
 import numpy as np

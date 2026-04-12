@@ -16,6 +16,8 @@ events.out.tfevents.*
 *.ckpt
 partial_strategies.npy
 strategies.npy
+/checkpoints/
+/storage/
 
 # Local logs
 *.log
