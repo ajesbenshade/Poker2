@@ -10,52 +10,66 @@ except ImportError:
     ray = None
 
 
+NODE_REGRET_INDEX = 0
+NODE_STRATEGY_INDEX = 1
+
+
 def _empty_node():
-    return {
-        'regret_sum': torch.zeros(Config.NUM_ACTIONS, dtype=Config.DTYPE, device='cpu'),
-        'strategy_sum': torch.zeros(Config.NUM_ACTIONS, dtype=Config.DTYPE, device='cpu'),
-    }
+    return torch.zeros((2, Config.NUM_ACTIONS), dtype=Config.STORAGE_DTYPE, device='cpu')
 
 
 class LocalNodeStore:
-    def __init__(self, device=Config.DEVICE):
-        self.device = device
+    def __init__(self, device=None):
+        self.device = Config.DEVICE if device is None else device
         self.nodes = defaultdict(_empty_node)
 
+    def _read(self, key, index):
+        return self.nodes[key][index].to(device=self.device, dtype=Config.DTYPE)
+
     def get_regret_sum(self, key):
-        return self.nodes[key]['regret_sum'].to(self.device)
+        return self._read(key, NODE_REGRET_INDEX)
 
     def get_strategy_sum(self, key):
-        return self.nodes[key]['strategy_sum'].to(self.device)
+        return self._read(key, NODE_STRATEGY_INDEX)
 
     def update_regret_sum(self, key, delta):
-        self.nodes[key]['regret_sum'] += delta.detach().cpu()
+        self.nodes[key][NODE_REGRET_INDEX].add_(
+            delta.detach().to(device='cpu', dtype=Config.STORAGE_DTYPE)
+        )
 
     def update_strategy_sum(self, key, delta):
-        self.nodes[key]['strategy_sum'] += delta.detach().cpu()
+        self.nodes[key][NODE_STRATEGY_INDEX].add_(
+            delta.detach().to(device='cpu', dtype=Config.STORAGE_DTYPE)
+        )
 
     def get_all_keys(self):
         return list(self.nodes.keys())
 
 
 class RemoteNodeStore:
-    def __init__(self, actor, device=Config.DEVICE):
+    def __init__(self, actor, device=None):
         if ray is None:
             raise RuntimeError("Ray is not installed; remote node storage is unavailable.")
         self.actor = actor
-        self.device = device
+        self.device = Config.DEVICE if device is None else device
 
     def get_regret_sum(self, key):
-        return ray.get(self.actor.get_regret_sum.remote(key)).to(self.device)
+        return ray.get(self.actor.get_regret_sum.remote(key)).to(device=self.device, dtype=Config.DTYPE)
 
     def get_strategy_sum(self, key):
-        return ray.get(self.actor.get_strategy_sum.remote(key)).to(self.device)
+        return ray.get(self.actor.get_strategy_sum.remote(key)).to(device=self.device, dtype=Config.DTYPE)
 
     def update_regret_sum(self, key, delta):
-        self.actor.update_regret_sum.remote(key, delta.detach().cpu())
+        self.actor.update_regret_sum.remote(
+            key,
+            delta.detach().to(device='cpu', dtype=Config.STORAGE_DTYPE),
+        )
 
     def update_strategy_sum(self, key, delta):
-        self.actor.update_strategy_sum.remote(key, delta.detach().cpu())
+        self.actor.update_strategy_sum.remote(
+            key,
+            delta.detach().to(device='cpu', dtype=Config.STORAGE_DTYPE),
+        )
 
     def get_all_keys(self):
         return ray.get(self.actor.get_all_keys.remote())

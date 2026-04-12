@@ -38,10 +38,11 @@ def _hole_features(hole):
 
 def simulate_features(num_sims=None):
     num_sims = Config.NUM_SIMS if num_sims is None else num_sims
-    batches = (num_sims + Config.BATCH_SIZE - 1) // Config.BATCH_SIZE
-    features = np.zeros((num_sims, 5))  # equity, suited, rank_sum, pot_odds, position
+    batch_size = max(1, int(Config.current_batch_size()))
+    batches = (num_sims + batch_size - 1) // batch_size
+    features = np.zeros((num_sims, 5), dtype=np.float32)  # equity, suited, rank_sum, pot_odds, position
     for i in range(batches):
-        start, end = i * Config.BATCH_SIZE, min((i + 1) * Config.BATCH_SIZE, num_sims)
+        start, end = i * batch_size, min((i + 1) * batch_size, num_sims)
         batch_decks = [_new_deck() for _ in range(end - start)]
         for deck in batch_decks:
             deck.shuffle()
@@ -49,17 +50,20 @@ def simulate_features(num_sims=None):
         batch_boards = [[] for _ in range(end - start)]
         equities = simulate_equity_batch(batch_holes, batch_boards)
         for j, (hole, equity) in enumerate(zip(batch_holes, equities)):
-            idx = i * Config.BATCH_SIZE + j
+            idx = i * batch_size + j
             suited, rank_sum = _hole_features(hole)
             pot_odds = np.random.uniform(0.1, 0.9)
-            position = np.random.randint(0, 6) / 5.0
-            features[idx] = [equity, suited, rank_sum, pot_odds, position]
-    return features
+            position = np.random.randint(0, 2)
+            features[idx] = np.nan_to_num([equity, suited, rank_sum, pot_odds, position], nan=0.0, posinf=1.0, neginf=0.0)
+    return np.nan_to_num(features.astype(np.float32, copy=False), nan=0.0, posinf=1.0, neginf=0.0)
 
 def create_buckets(features, num_buckets=None):
     num_buckets = Config.NUM_BUCKETS if num_buckets is None else num_buckets
-    kmeans = KMeans(n_clusters=num_buckets, random_state=42).fit(features)
-    return kmeans.labels_, kmeans.cluster_centers_
+    if len(features) == 0:
+        return np.asarray([], dtype=np.int64), np.asarray([], dtype=np.float32)
+    safe_bucket_count = max(1, min(int(num_buckets), len(features)))
+    kmeans = KMeans(n_clusters=safe_bucket_count, random_state=42, n_init=10).fit(features)
+    return kmeans.labels_, kmeans.cluster_centers_.astype(np.float32, copy=False)
 
 
 def feature_vector_size(history_length=None):
@@ -101,13 +105,14 @@ def encode_infoset(infoset: Infoset, history_length=None):
         infoset.history_length / max(history_length, 1),
     ], dtype=np.float32)
 
-    return np.concatenate((
+    encoded = np.concatenate((
         private_cards,
         board_cards,
         street_features,
         scalar_features,
         history_features,
     )).astype(np.float32, copy=False)
+    return np.nan_to_num(encoded, nan=0.0, posinf=1.0, neginf=0.0)
 
 
 def encode_infosets(infosets, device=Config.DEVICE, history_length=None):
@@ -115,6 +120,7 @@ def encode_infosets(infosets, device=Config.DEVICE, history_length=None):
     if not infosets:
         return torch.empty((0, feature_vector_size(history_length)), device=device, dtype=torch.float32)
     encoded = np.stack([encode_infoset(infoset, history_length=history_length) for infoset in infosets])
+    encoded = np.nan_to_num(encoded, nan=0.0, posinf=1.0, neginf=0.0)
     return torch.tensor(encoded, device=device, dtype=torch.float32)
 
 if __name__ == "__main__":

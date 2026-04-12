@@ -1,0 +1,25 @@
+# Python compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# PyTorch and training artifacts
+*.pt
+*.npy
+*.json
+*.log
+runs/
+
+# MacOS files
+.DS_Store
+
+# Editor settings
+*.swp
+*.swo
+.idea/
+.vscode/
