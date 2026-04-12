@@ -4,6 +4,21 @@ import torch
 class Config:
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
     DTYPE = torch.bfloat16
+    NN_DTYPE = torch.float32
+
+    SEED = 42
+    ALGORITHM_MODE = 'tabular'
+    ENVIRONMENT_MODE = 'simplified'
+    INFOSET_KEY_MODE = 'legacy'
+
+    RAY_NUM_CPUS = 24
+    RAY_NUM_GPUS = 1 if torch.cuda.is_available() else 0
+    HAND_EVAL_PROCESSES = 24
+    LOG_INTERVAL = 1000
+    CHECKPOINT_INTERVAL = 10000
+    EVAL_INTERVAL = 5000
+    MAX_DEPTH = 3
+
     NUM_BUCKETS = 5000
     NUM_SIMS = 100000
     ITERATIONS = 1000000
@@ -12,8 +27,12 @@ class Config:
     NUM_ACTIONS = 3
     NUM_OPPONENTS = 1
     BATCH_SIZE = 1024
+
+    INITIAL_STACK = 1000.0
     POT_SIZE = 100.0
     CALL_AMOUNT = 20.0
+    DEFAULT_STACK_SIZES = (INITIAL_STACK, INITIAL_STACK)
+
     RAISE_MULTIPLIER = 3.0
     FOLD_EQUITY_MEAN = 0.4
     FOLD_EQUITY_STD = 0.3
@@ -21,3 +40,13 @@ class Config:
     EQUITY_ROLLOUTS = 40
     BLUFF_FACTOR = 0.3
     FOLD_PENALTY = 0.5
+
+    HISTORY_FEATURES = 16
+    CARD_FEATURES = 52
+    MODEL_HIDDEN_DIM = 128
+    MODEL_NUM_LAYERS = 2
+    REPLAY_BUFFER_SIZE = 100000
+    NN_BATCH_SIZE = 512
+    NN_TRAIN_STEPS = 50
+    NN_LEARNING_RATE = 1e-3
+    DEEP_CFR_TRAVERSALS_PER_ITER = 1
