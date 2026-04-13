@@ -143,5 +143,20 @@ def simulate_action_batch(infosets, actions):
 def simulate_action(infoset, action: Action):
     return simulate_action_batch([infoset], [action])[0]
 
+
+def quick_simulate(infoset, action: Action, simulations=32):
+    # Fast low-fidelity utility estimate used for cheap policy probes.
+    values = []
+    sims = max(4, int(simulations))
+    for _ in range(sims):
+        values.append(simulate_action(infoset, action))
+    return float(np.mean(values))
+
+
+def hybrid_equity(nn_equity, mc_equity, weight=None):
+    weight = Config.HYBRID_EQUITY_WEIGHT if weight is None else float(weight)
+    weight = float(np.clip(weight, 0.0, 1.0))
+    return float(weight * nn_equity + (1.0 - weight) * mc_equity)
+
 def terminal(infoset):
     return len(infoset.history) >= 4

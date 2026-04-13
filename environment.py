@@ -6,16 +6,25 @@ import psutil
 
 ROCM_ENV_DEFAULTS = {
     'HIP_VISIBLE_DEVICES': '0',
-    'HSA_OVERRIDE_GFX_VERSION': '11_0_0',
-    'PYTORCH_HIP_ALLOC_CONF': 'garbage_collection_threshold:0.8,expandable_segments:True',
+    'HSA_OVERRIDE_GFX_VERSION': '11.0.0',
+    'PYTORCH_HIP_ALLOC_CONF': 'garbage_collection_threshold:0.6,expandable_segments:True',
     'PYTORCH_NO_ROCM_EXPANDABLE_SEGMENTS_WARNING': '1',
+    'OMP_NUM_THREADS': '1',
 }
+
+ROCM_HSA_FALLBACK = '10.3.0'
 
 
 def setup_rocmo():
     for key, value in ROCM_ENV_DEFAULTS.items():
-        os.environ.setdefault(key, value)
+        os.environ[key] = value
     return dict(ROCM_ENV_DEFAULTS)
+
+
+def apply_hsa_fallback():
+    # Use fallback only after a failed device initialization attempt.
+    os.environ['HSA_OVERRIDE_GFX_VERSION'] = ROCM_HSA_FALLBACK
+    return ROCM_HSA_FALLBACK
 
 
 def setup_rocm():
