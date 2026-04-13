@@ -1,4 +1,3 @@
-import math
 from collections import defaultdict
 from dataclasses import dataclass
 import pickle
@@ -11,7 +10,7 @@ from torch.amp import GradScaler
 from config import Config
 from datatypes import Action, Infoset
 from environment import clear_runtime_caches, get_memory_snapshot
-from game import simulate_action_batch, simulate_equity_batch
+from game import simulate_action_batch
 from models import ActorCriticModel, CustomBeta
 from storage import Float16ReservoirBuffer
 from utils import adapt_batch_and_sims, select_amp_dtype
@@ -62,17 +61,22 @@ class PrioritizedReplayBackend:
             return self._fallback.add_batch(states_np, targets_np, priorities)
 
         inserted = 0
-        with self._env.begin(write=True) as txn:
-            for row in range(states_np.shape[0]):
-                key = f"{self._size % self._capacity:08d}".encode("ascii")
-                payload = {
-                    "state": np.asarray(states_np[row], dtype=np.float16),
-                    "target": np.asarray(targets_np[row], dtype=np.float16),
-                    "priority": float(priorities[row]),
-                }
-                txn.put(key, pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL))
-                self._size += 1
-                inserted += 1
+        try:
+            with self._env.begin(write=True) as txn:
+                for row in range(states_np.shape[0]):
+                    key = f"{self._size % self._capacity:08d}".encode("ascii")
+                    payload = {
+                        "state": np.asarray(states_np[row], dtype=np.float16),
+                        "target": np.asarray(targets_np[row], dtype=np.float16),
+                        "priority": float(priorities[row]),
+                    }
+                    txn.put(key, pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL))
+                    self._size += 1
+                    inserted += 1
+        except Exception:
+            # Fall back to memmap storage if LMDB write fails mid-run.
+            self._env = None
+            return self._fallback.add_batch(states_np, targets_np, priorities)
         return inserted
 
     def state_dict(self):

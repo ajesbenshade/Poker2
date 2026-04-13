@@ -3,7 +3,11 @@ import logging
 import multiprocessing as mp
 import os
 
-os.environ.setdefault("OMP_NUM_THREADS", "1")
+# Apply ROCm-critical env vars before importing torch.
+os.environ["HIP_VISIBLE_DEVICES"] = "0"
+os.environ["HSA_OVERRIDE_GFX_VERSION"] = "11.0.0"
+os.environ["PYTORCH_HIP_ALLOC_CONF"] = "garbage_collect_threshold:0.6,expandable_segment:True,max_split_size_mb:128"
+os.environ["OMP_NUM_THREADS"] = "1"
 
 from environment import apply_hsa_fallback, get_memory_snapshot, setup_rocmo
 
@@ -33,7 +37,6 @@ logging.basicConfig(
 
 def parse_args():
     parser = argparse.ArgumentParser(description="PPO-first Poker2 trainer tuned for RX 7900 XT ROCm.")
-    parser.add_argument("--mode", choices=["ppo", "legacy-deep"], default="ppo")
     parser.add_argument("--smoke-test", action="store_true", help="Run a short PPO validation profile")
     parser.add_argument("--long-run", action="store_true", help="Run the long unattended profile")
     parser.add_argument("--iterations", type=int, default=None)
@@ -90,8 +93,7 @@ def apply_runtime_profile(args):
 def _log_startup(args):
     snapshot = get_memory_snapshot()
     logger.info(
-        "mode=%s | smoke=%s | iterations=%s | batch=%s | sims=%s | amp=%s | bf16_opt_in=%s",
-        args.mode,
+        "smoke=%s | iterations=%s | batch=%s | sims=%s | amp=%s | bf16_opt_in=%s",
         args.smoke_test,
         Config.ITERATIONS,
         Config.BATCH_SIZE,
@@ -107,10 +109,11 @@ def _log_startup(args):
         snapshot["ram_pct"],
     )
     logger.info(
-        "ROCm env: HIP_VISIBLE_DEVICES=%s | HSA_OVERRIDE_GFX_VERSION=%s | PYTORCH_HIP_ALLOC_CONF=%s",
+        "ROCm env: HIP_VISIBLE_DEVICES=%s | HSA_OVERRIDE_GFX_VERSION=%s | PYTORCH_HIP_ALLOC_CONF=%s | OMP_NUM_THREADS=%s",
         os.environ.get("HIP_VISIBLE_DEVICES", "0"),
         os.environ.get("HSA_OVERRIDE_GFX_VERSION", "11.0.0"),
         os.environ.get("PYTORCH_HIP_ALLOC_CONF", ""),
+        os.environ.get("OMP_NUM_THREADS", "1"),
     )
 
 
@@ -188,11 +191,6 @@ def main():
     apply_runtime_profile(args)
     _log_startup(args)
     _rocm_sanity_or_fallback()
-
-    if args.mode == "legacy-deep":
-        logger.info("legacy-deep mode is archived on this branch; use --mode ppo")
-        return
-
     train_ppo(args)
 
 

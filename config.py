@@ -32,9 +32,12 @@ class Config:
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
     DTYPE = torch.float32
     NN_DTYPE = torch.float32
+
+    # ROCm AMP policy: prefer bf16 when supported, otherwise fallback to fp16.
     AMP_ENABLED = True
     AMP_DTYPE = torch.float16
-    AMP_BF16_OPT_IN = False
+    AMP_BF16_OPT_IN = True
+    AMP_PREFER_BF16 = True
     USE_TORCH_COMPILE = False
 
     # Thread safety on ROCm + multiprocessing.
@@ -98,7 +101,7 @@ class Config:
     UTILITY_CLAMP = 4.0
 
     # Memory guardrails for this 7900 XT rig.
-    VRAM_SOFT_LIMIT_GB = 18.0
+    VRAM_SOFT_LIMIT_GB = 18.5
     RAM_SOFT_LIMIT_PCT = 82.0
     RECOVERY_VRAM_PCT = 0.72
     RECOVERY_RAM_MARGIN = 8.0
@@ -113,7 +116,7 @@ class Config:
     REPLAY_WARMUP_SAMPLES = 4096
 
     # Multiprocessing and workers.
-    MP_PROCESSES = min(24, max(20, os.cpu_count() or 24))
+    MP_PROCESSES = 20
 
     # Smoke-test profile.
     SMOKE_TEST_ITERATIONS = 4

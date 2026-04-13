@@ -16,7 +16,8 @@ class BatchAdaptationResult:
 
 
 def select_amp_dtype(config):
-    if config.AMP_BF16_OPT_IN and torch.cuda.is_available() and hasattr(torch.cuda, "is_bf16_supported"):
+    prefer_bf16 = getattr(config, "AMP_PREFER_BF16", False) or getattr(config, "AMP_BF16_OPT_IN", False)
+    if prefer_bf16 and torch.cuda.is_available() and hasattr(torch.cuda, "is_bf16_supported"):
         if torch.cuda.is_bf16_supported():
             return torch.bfloat16
     return torch.float16
