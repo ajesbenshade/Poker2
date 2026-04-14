@@ -29,7 +29,7 @@ def encode_samples(holes, boards, num_opponents):
         for card in board:
             features[index, 52 + card_to_id(card)] = 1.0
         features[index, 104] = len(board) / 5.0
-        features[index, 105] = num_opponents / max(1, Config.MAX_CURRICULUM_OPPONENTS)
+        features[index, 105] = num_opponents / max(1, Config.TARGET_OPPONENTS)
     return features
 
 
