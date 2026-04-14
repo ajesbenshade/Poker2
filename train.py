@@ -83,6 +83,7 @@ def parse_args():
     parser.add_argument("--replay-warmup-samples", "--replay_warmup_samples", dest="replay_warmup_samples", type=int, default=None, help="Set PPO replay warmup threshold")
     parser.add_argument("--lmdb-map-size-gb", "--lmdb_map_size", dest="lmdb_map_size_gb", type=_parse_lmdb_map_size, default=None, help="Set LMDB map size for PPO replay, in GB or raw bytes")
     parser.add_argument("--log-interval", "--log-every", "--log_every", dest="log_interval", type=int, default=None)
+    parser.add_argument("--train-steps", "--training-steps", "--num-training-steps", "--num_training_steps", dest="num_training_steps", type=int, default=None, help="Set PPO training steps per iteration")
     parser.add_argument("--checkpoint-interval", type=int, default=None)
     parser.add_argument("--validation-interval", "--validation_interval", dest="validation_interval", type=int, default=None)
     parser.add_argument("--entropy-coef", "--entropy-beta", "--entropy_coef", "--entropy", dest="entropy_coef", type=float, default=None, help="Override PPO entropy coefficient")
@@ -170,6 +171,9 @@ def apply_runtime_profile(args):
         custom_overrides = True
     if args.log_interval is not None:
         Config.LOG_INTERVAL = args.log_interval
+        custom_overrides = True
+    if args.num_training_steps is not None:
+        Config.NUM_TRAINING_STEPS = max(1, int(args.num_training_steps))
         custom_overrides = True
     if args.checkpoint_interval is not None:
         Config.CHECKPOINT_INTERVAL = args.checkpoint_interval
