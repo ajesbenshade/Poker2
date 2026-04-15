@@ -35,7 +35,14 @@ def ensure_numpy_float32(tensor):
     return np.asarray(tensor, dtype=np.float32)
 
 
-def adapt_batch_and_sims(config, current_batch_size, current_simulations, force_backoff=False, reason_override=None):
+def adapt_batch_and_sims(
+    config,
+    current_batch_size,
+    current_simulations,
+    force_backoff=False,
+    reason_override=None,
+    recovery_on_cooldown=False,
+):
     snapshot = get_memory_snapshot()
     over_vram = snapshot["used_gb"] > config.VRAM_SOFT_LIMIT_GB
     over_ram = snapshot["ram_pct"] > config.RAM_SOFT_LIMIT_PCT
@@ -62,7 +69,12 @@ def adapt_batch_and_sims(config, current_batch_size, current_simulations, force_
     recovery_vram = config.VRAM_SOFT_LIMIT_GB * config.RECOVERY_VRAM_PCT
     recovery_ram = config.RAM_SOFT_LIMIT_PCT - config.RECOVERY_RAM_MARGIN
     allow_recovery = getattr(config, "DEVICE", "cpu") == "cuda" and snapshot["total_gb"] > 0.0
-    if allow_recovery and snapshot["used_gb"] < recovery_vram and snapshot["ram_pct"] < recovery_ram:
+    if (
+        allow_recovery
+        and not recovery_on_cooldown
+        and snapshot["used_gb"] < recovery_vram
+        and snapshot["ram_pct"] < recovery_ram
+    ):
         ladder = list(config.BATCH_SIZE_LADDER)
         recovery_batch_cap = int(getattr(config, "RECOVERY_BATCH_CAP", ladder[0]))
         recovery_sim_cap = int(getattr(config, "RECOVERY_SIMULATION_CAP", config.MAX_NUM_SIMULATIONS))

@@ -99,7 +99,7 @@ class PrioritizedReplayBackend:
 class OpponentModel:
     def __init__(self):
         self.action_hist = defaultdict(lambda: np.ones(Config.NUM_ACTIONS, dtype=np.float32) / Config.NUM_ACTIONS)
-        self.decay = 0.95
+        self.decay = float(getattr(Config, "OPPONENT_DECAY", 0.95))
 
     def update(self, key, action):
         hist = self.action_hist[key]
@@ -210,6 +210,7 @@ class ActorCriticAgent:
         self.current_batch_size = Config.BATCH_SIZE
         self.current_simulations = Config.NUM_SIMULATIONS
         self.iteration = 0
+        self.backoff_cooldown = 0
         self.num_opponents = Config.START_OPPONENTS
         self.opponent_model = OpponentModel()
         self.elo_tracker = EloTracker(k_factor=Config.ELO_K_FACTOR)
@@ -337,6 +338,10 @@ class ActorCriticAgent:
         )
         self.current_batch_size = adaptation.batch_size
         self.current_simulations = adaptation.simulations
+        self.backoff_cooldown = max(
+            self.backoff_cooldown,
+            int(getattr(Config, "RUNTIME_ERROR_BACKOFF_COOLDOWN_ITERS", 8)),
+        )
         Config.BATCH_SIZE = self.current_batch_size
         Config.NUM_SIMULATIONS = self.current_simulations
         snapshot = get_memory_snapshot()
@@ -385,6 +390,12 @@ class ActorCriticAgent:
         for idx, infoset in enumerate(infosets):
             raise_boost = self._preflop_raise_boost(infoset)
             probs[idx, Action.RAISE.value] = torch.clamp(probs[idx, Action.RAISE.value] + raise_boost, max=0.98)
+            cached_aggression = self.opponent_model.aggression(infoset.key)
+            if cached_aggression > float(getattr(Config, "EXPLOIT_AGGRESSION_THRESHOLD", 0.55)):
+                probs[idx, Action.RAISE.value] = torch.clamp(
+                    probs[idx, Action.RAISE.value] * float(getattr(Config, "EXPLOIT_RAISE_MULTIPLIER", 1.15)),
+                    max=0.98,
+                )
             probs[idx] = probs[idx] / probs[idx].sum()
 
             use_mcts = (
@@ -462,6 +473,9 @@ class ActorCriticAgent:
         num_samples = rollout.states.shape[0]
         mini_size = max(1, num_samples // Config.PPO_MINIBATCHES)
         num_training_steps = max(1, int(getattr(Config, "NUM_TRAINING_STEPS", Config.PPO_EPOCHS)))
+        grad_accum_steps = max(1, int(getattr(Config, "GRADIENT_ACCUMULATION_STEPS", 1)))
+        cache_clear_interval = int(getattr(Config, "CACHE_CLEAR_INTERVAL_STEPS", 0))
+        optimizer_step_count = 0
         losses = []
         policy_losses = []
         value_losses = []
@@ -469,6 +483,8 @@ class ActorCriticAgent:
 
         for _ in range(num_training_steps):
             permutation = torch.randperm(num_samples, device=self.device)
+            accum_counter = 0
+            self.optimizer.zero_grad(set_to_none=True)
             for start in range(0, num_samples, mini_size):
                 idx = permutation[start:start + mini_size]
                 states = rollout.states[idx]
@@ -503,12 +519,19 @@ class ActorCriticAgent:
                         value_loss = F.mse_loss(values.float(), returns.float())
                     loss = policy_loss + Config.VALUE_COEF * value_loss - self._current_entropy_coef() * entropy
 
-                self.optimizer.zero_grad(set_to_none=True)
-                self.scaler.scale(loss).backward()
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), Config.MAX_GRAD_NORM)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                self.scaler.scale(loss / grad_accum_steps).backward()
+                accum_counter += 1
+                is_last_minibatch = (start + mini_size) >= num_samples
+                if accum_counter >= grad_accum_steps or is_last_minibatch:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), Config.MAX_GRAD_NORM)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                    self.optimizer.zero_grad(set_to_none=True)
+                    accum_counter = 0
+                    optimizer_step_count += 1
+                    if cache_clear_interval > 0 and optimizer_step_count % cache_clear_interval == 0:
+                        clear_runtime_caches()
 
                 losses.append(float(loss.detach().item()))
                 policy_losses.append(float(policy_loss.detach().item()))
@@ -608,7 +631,21 @@ class ActorCriticAgent:
     def train_iteration(self):
         self.maybe_update_curriculum()
 
-        adaptation = adapt_batch_and_sims(Config, self.current_batch_size, self.current_simulations)
+        recovery_on_cooldown = self.backoff_cooldown > 0
+        if self.backoff_cooldown > 0:
+            self.backoff_cooldown -= 1
+
+        adaptation = adapt_batch_and_sims(
+            Config,
+            self.current_batch_size,
+            self.current_simulations,
+            recovery_on_cooldown=recovery_on_cooldown,
+        )
+        if adaptation.reason in {"memory-pressure", "runtime-error"}:
+            self.backoff_cooldown = max(
+                self.backoff_cooldown,
+                int(getattr(Config, "MEMORY_BACKOFF_COOLDOWN_ITERS", 4)),
+            )
         self.current_batch_size = adaptation.batch_size
         self.current_simulations = adaptation.simulations
         Config.BATCH_SIZE = self.current_batch_size

@@ -1,9 +1,23 @@
 import argparse
+import gc
 import logging
 import multiprocessing as mp
 import os
 import subprocess
 import sys
+
+os.environ.setdefault("HIP_VISIBLE_DEVICES", "0")
+os.environ.setdefault("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
+os.environ.setdefault(
+    "PYTORCH_HIP_ALLOC_CONF",
+    "expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:512",
+)
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", os.environ["PYTORCH_HIP_ALLOC_CONF"])
+os.environ.setdefault("PYTORCH_NO_ROCM_EXPANDABLE_SEGMENTS_WARNING", "1")
+os.environ.setdefault("HSA_ENABLE_SDMA", "0")
+os.environ.setdefault("TORCH_CUDNN_ENABLE", "0")
+os.environ.setdefault("TORCH_ROCM_AOTRITON_DISABLE", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 from environment import get_memory_snapshot, initialize_rocm_runtime
 
@@ -138,6 +152,7 @@ def apply_runtime_profile(args):
         Config.LOG_INTERVAL = Config.MEDIUM_RUN_LOG_INTERVAL
         Config.VALIDATION_INTERVAL = Config.MEDIUM_RUN_VALIDATION_INTERVAL
         Config.NUM_TRAINING_STEPS = Config.MEDIUM_RUN_NUM_TRAINING_STEPS
+        Config.GRADIENT_ACCUMULATION_STEPS = Config.MEDIUM_RUN_GRADIENT_ACCUMULATION_STEPS
         Config.REPLAY_BUFFER_SIZE = Config.MEDIUM_RUN_REPLAY_BUFFER_SIZE
         Config.LMDB_MAP_SIZE_GB = Config.MEDIUM_RUN_LMDB_MAP_SIZE_GB
         Config.ENTROPY_COEF = Config.MEDIUM_RUN_ENTROPY_COEF
@@ -382,6 +397,24 @@ def train_ppo(args):
         for _ in range(Config.ITERATIONS):
             metrics = agent.train_iteration()
             maybe_start_equity_training(agent.iteration, agent.num_opponents)
+
+            # Periodic cache cleanup to reduce long-run ROCm VRAM ratcheting.
+            if agent.iteration > 0 and agent.iteration % 10 == 0 and Config.DEVICE == "cuda":
+                torch.cuda.empty_cache()
+                gc.collect()
+                snapshot = get_memory_snapshot()
+                if snapshot["used_gb"] > Config.VRAM_SOFT_LIMIT_GB:
+                    new_batch = max(4096, int(agent.current_batch_size) // 2)
+                    if new_batch < agent.current_batch_size:
+                        agent.current_batch_size = new_batch
+                        Config.BATCH_SIZE = new_batch
+                        Config.RECOVERY_BATCH_CAP = min(Config.RECOVERY_BATCH_CAP, new_batch)
+                        logger.warning(
+                            "vram soft limit hit after cache clear (%.2f GB) -> reducing batch to %s",
+                            snapshot["used_gb"],
+                            new_batch,
+                        )
+
             if metrics["elo"] > best_elo:
                 best_elo = metrics["elo"]
                 agent.save_checkpoint(agent.iteration, metrics, is_best=True)
