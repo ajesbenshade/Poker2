@@ -128,7 +128,8 @@ class EloTracker:
 class PopulationManager:
     @staticmethod
     def _clone_state_dict(state_dict):
-        return {name: tensor.detach().clone() for name, tensor in state_dict.items()}
+        # Always store on CPU to avoid consuming VRAM for population history.
+        return {name: tensor.detach().cpu().clone() for name, tensor in state_dict.items()}
 
     def __init__(self, base_state_dict):
         self.population = [self._clone_state_dict(base_state_dict) for _ in range(Config.POPULATION_SIZE)]
@@ -150,6 +151,7 @@ class PopulationManager:
             std = tensor.float().std(unbiased=False) if tensor.numel() > 1 else tensor.new_tensor(1.0, dtype=torch.float32)
             noise = torch.randn_like(tensor) * Config.POPULATION_MIX_MUTATION_SCALE * std.clamp(min=1e-6)
             mixed_state[name] = (tensor + noise).detach().clone()
+        # Return on CPU; caller moves to device before load_state_dict.
         return mixed_state
 
     def evolve(self, score_table):
@@ -167,7 +169,7 @@ class PopulationManager:
                 continue
             std = base_tensor.float().std(unbiased=False) if base_tensor.numel() > 1 else base_tensor.new_tensor(1.0, dtype=torch.float32)
             noise = torch.randn_like(base_tensor) * Config.PBT_MUTATION_SCALE * std.clamp(min=1e-6)
-            mutated[name] = (base_tensor + noise).detach().clone()
+            mutated[name] = (base_tensor + noise).detach().cpu().clone()
         self.population[worst_idx] = mutated
 
 
@@ -357,7 +359,9 @@ class ActorCriticAgent:
         population_rate = 0.0
         active_model = self.model
         if not deterministic and Config.POPULATION_MIX_PROB > 0.0 and np.random.random() < Config.POPULATION_MIX_PROB:
-            self.population_model.load_state_dict(self.population.sample_policy_state(), strict=True)
+            cpu_state = self.population.sample_policy_state()
+            device_state = {k: v.to(self.device) for k, v in cpu_state.items()}
+            self.population_model.load_state_dict(device_state, strict=True)
             active_model = self.population_model
             population_rate = 1.0
 

@@ -42,13 +42,20 @@ def adapt_batch_and_sims(config, current_batch_size, current_simulations, force_
 
     if force_backoff or over_vram or over_ram:
         ladder = list(config.BATCH_SIZE_LADDER)
+        emergency_vram_limit = float(getattr(config, "VRAM_EMERGENCY_LIMIT_GB", config.VRAM_SOFT_LIMIT_GB + 0.75))
+        batch_step = 2 if (force_backoff or snapshot["used_gb"] >= emergency_vram_limit) else 1
         if current_batch_size in ladder:
             idx = ladder.index(current_batch_size)
-            new_batch = ladder[min(idx + 1, len(ladder) - 1)]
+            new_batch = ladder[min(idx + batch_step, len(ladder) - 1)]
         else:
             new_batch = max(ladder[-1], current_batch_size // 2)
         min_sims = max(1, int(getattr(config, "MIN_NUM_SIMULATIONS", 64)))
-        new_sims = max(min_sims, int(current_simulations * 0.75))
+        pressure_cap = max(1, int(getattr(config, "PRESSURE_SIMULATION_CAP", current_simulations)))
+        drop_factor = 0.75 if force_backoff else 0.9
+        reduced_sims = int(current_simulations * drop_factor)
+        new_sims = max(min_sims, reduced_sims)
+        # Backoff should never increase simulations above the active setting.
+        new_sims = min(new_sims, current_simulations, pressure_cap)
         clear_runtime_caches()
         return BatchAdaptationResult(new_batch, new_sims, reason_override or "memory-pressure")
 

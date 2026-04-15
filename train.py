@@ -269,6 +269,7 @@ def apply_runtime_profile(args):
         Config.AMP_DTYPE = torch.float32
     _configure_torch_backends()
     Config.RECOVERY_BATCH_CAP = Config.BATCH_SIZE
+    Config.PRESSURE_SIMULATION_CAP = Config.NUM_SIMULATIONS
     Config.RECOVERY_SIMULATION_CAP = Config.NUM_SIMULATIONS
     torch.set_num_threads(Config.TORCH_NUM_THREADS)
 

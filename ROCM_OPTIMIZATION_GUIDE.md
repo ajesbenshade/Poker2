@@ -13,7 +13,7 @@ Use `PYTORCH_ALLOC_CONF`, not `PYTORCH_HIP_ALLOC_CONF`. The current default conf
 
 - `HIP_VISIBLE_DEVICES=0`
 - `HSA_OVERRIDE_GFX_VERSION=11.0.0`
-- `PYTORCH_ALLOC_CONF=expandable_segments:True,max_split_size_mb:512`
+- `PYTORCH_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:512`
 - `HSA_ENABLE_SDMA=0`
 - `TORCH_CUDNN_ENABLE=0`
 - `OMP_NUM_THREADS=1`
