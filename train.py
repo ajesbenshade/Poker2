@@ -399,11 +399,20 @@ def train_ppo(args):
             maybe_start_equity_training(agent.iteration, agent.num_opponents)
 
             # Periodic cache cleanup to reduce long-run ROCm VRAM ratcheting.
-            if agent.iteration > 0 and agent.iteration % 10 == 0 and Config.DEVICE == "cuda":
-                torch.cuda.empty_cache()
-                gc.collect()
+            clear_interval = max(1, int(getattr(Config, "CACHE_CLEAR_INTERVAL_ITERS", 10)))
+            proactive_clear_gb = float(getattr(Config, "VRAM_PROACTIVE_CLEAR_GB", Config.VRAM_SOFT_LIMIT_GB * 0.95))
+            if agent.iteration > 0 and agent.iteration % clear_interval == 0 and Config.DEVICE == "cuda":
                 snapshot = get_memory_snapshot()
+                if snapshot["used_gb"] >= proactive_clear_gb:
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                    snapshot = get_memory_snapshot()
+
+                # Only force a batch downshift if we still exceed soft limit after cleanup.
                 if snapshot["used_gb"] > Config.VRAM_SOFT_LIMIT_GB:
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                    snapshot = get_memory_snapshot()
                     new_batch = max(4096, int(agent.current_batch_size) // 2)
                     if new_batch < agent.current_batch_size:
                         agent.current_batch_size = new_batch

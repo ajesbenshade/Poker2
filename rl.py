@@ -361,6 +361,9 @@ class ActorCriticAgent:
     def choose_action(self, infosets, deterministic=False):
         states_np = np.stack([self._state_from_infoset(i) for i in infosets], axis=0)
         states = torch.as_tensor(states_np, dtype=torch.float32, device=self.device)
+        snapshot = get_memory_snapshot()
+        mcts_vram_disable_gb = float(getattr(Config, "MCTS_VRAM_DISABLE_GB", Config.VRAM_SOFT_LIMIT_GB * 0.93))
+        mcts_enabled_for_snapshot = snapshot["used_gb"] < mcts_vram_disable_gb
         population_rate = 0.0
         active_model = self.model
         if not deterministic and Config.POPULATION_MIX_PROB > 0.0 and np.random.random() < Config.POPULATION_MIX_PROB:
@@ -399,6 +402,8 @@ class ActorCriticAgent:
             probs[idx] = probs[idx] / probs[idx].sum()
 
             use_mcts = (
+                mcts_enabled_for_snapshot
+                and
                 Config.MCTS_MAX_DEPTH > 0
                 and
                 equities[idx] > Config.MCTS_EQUITY_THRESHOLD
