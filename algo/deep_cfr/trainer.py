@@ -32,6 +32,7 @@ from engine.encoder import OBS_DIM
 from .buffer import ReservoirBuffer
 from .config import DeepCFRConfig
 from .eval import evaluate_vs_baselines
+from .lbr import evaluate_lbr
 from .network import AdvantageNet, PolicyNet
 from .traversal import external_sampling
 from . import worker as _worker_mod
@@ -94,6 +95,13 @@ class DeepCFRTrainer:
             num_blocks=cfg.num_blocks,
             dropout=cfg.dropout,
         ).to(self.device)
+        if cfg.use_torch_compile and self.device.type == "cuda":
+            try:
+                self.policy_net = torch.compile(
+                    self.policy_net, mode="reduce-overhead", dynamic=False
+                )
+            except Exception as e:
+                logger.warning("torch.compile(policy_net) failed: %s", e)
 
         # Buffers
         self.advantage_buffers = [
@@ -128,6 +136,11 @@ class DeepCFRTrainer:
             num_blocks=self.cfg.num_blocks,
             dropout=self.cfg.dropout,
         ).to(self.device)
+        if self.cfg.use_torch_compile and self.device.type == "cuda":
+            try:
+                net = torch.compile(net, mode="reduce-overhead", dynamic=False)
+            except Exception as e:
+                logger.warning("torch.compile failed: %s", e)
         return net
 
     def _train_net(
@@ -429,11 +442,24 @@ class DeepCFRTrainer:
             self.save_checkpoint(os.path.join(cfg.checkpoint_dir, "latest.pt"),
                                  meta={"iter": t})
 
+            # 5) Periodic LBR exploitability (Phase G)
+            lbr_mbbg = None
+            if cfg.lbr_interval > 0 and t % cfg.lbr_interval == 0:
+                lbr_mbbg = evaluate_lbr(
+                    self.policy_net, cfg, self.device,
+                    num_hands=cfg.lbr_hands,
+                    equity_samples=cfg.lbr_equity_samples,
+                    rng=random.Random(cfg.seed + 7000 + t),
+                )
+                self.writer.add_scalar("eval/lbr_mbb_per_game", lbr_mbbg, t)
+
             if t % max(1, cfg.log_interval) == 0:
                 eval_str = (
                     " | eval " + " ".join(f"{k}={v:+.1f}mbb" for k, v in eval_payload.items())
                     if eval_payload else ""
                 )
+                if lbr_mbbg is not None:
+                    eval_str += f" | lbr={lbr_mbbg:+.1f}mbb"
                 logger.info(
                     "iter %d | adv_loss %s | pol_loss %.4f | adv_buf %s | strat_buf %d | %.1fs%s",
                     t,

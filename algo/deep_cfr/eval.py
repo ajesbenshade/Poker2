@@ -176,23 +176,37 @@ def evaluate_vs_baselines(
     num_hands: Optional[int] = None,
     rng: Optional[random.Random] = None,
 ) -> Dict[str, float]:
-    """Run trained policy in seat 0 vs each baseline in seat 1 (HU only).
+    """Run trained policy vs each baseline. Returns ``{name: mbb_per_game}``.
 
-    Returns a dict ``{baseline_name: mbb_per_game}`` of trained policy's
-    per-hand winnings in milli-big-blinds.
+    HU (num_players=2): trained plays both seats in turn (button rotated)
+    against the baseline; results are averaged for positional symmetry.
+
+    Multi-way (num_players>2): trained plays seat 0 vs N-1 baseline copies.
+    Results are averaged across button rotations of the trained's seat
+    so positional bias is removed (each seat plays the trained for
+    1/N of hands).
     """
-    if cfg.num_players != 2:
-        # Multi-way evaluation is implemented post-Phase-4.
-        return {}
     n = num_hands or cfg.eval_hands
     bb = cfg.big_blind
     rng = rng or random.Random(0xBEEF)
     trained = policy_from_net(net, device, deterministic=False)
+    np_ = cfg.num_players
     results: Dict[str, float] = {}
     for name, baseline in BASELINES.items():
-        # Average two orderings to remove positional advantage.
-        a = play_match([trained, baseline], n, cfg, rng=random.Random(rng.random()))
-        b = play_match([baseline, trained], n, cfg, rng=random.Random(rng.random()))
-        chips_per_hand = (a[0] + b[1]) / 2.0
+        if np_ == 2:
+            a = play_match([trained, baseline], n, cfg, rng=random.Random(rng.random()))
+            b = play_match([baseline, trained], n, cfg, rng=random.Random(rng.random()))
+            chips_per_hand = (a[0] + b[1]) / 2.0
+        else:
+            # Multi-way: rotate trained's seat across all positions.
+            per_seat = max(1, n // np_)
+            total = 0.0
+            for s in range(np_):
+                policies = [baseline] * np_
+                policies[s] = trained
+                avgs = play_match(policies, per_seat, cfg,
+                                  rng=random.Random(rng.random()))
+                total += avgs[s]
+            chips_per_hand = total / np_
         results[name] = chips_per_hand * 1000.0 / bb
     return results

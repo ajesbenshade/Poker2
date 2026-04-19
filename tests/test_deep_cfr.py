@@ -336,3 +336,66 @@ def test_worker_run_chunk_returns_arrays():
     # At least one of advantage / strategy samples must be produced.
     assert (a_obs.shape[0] + s_obs.shape[0]) > 0
 
+
+# ---------------------------------------------------------------------------
+# LBR exploitability (Phase G)
+# ---------------------------------------------------------------------------
+
+def test_lbr_runs_and_returns_finite_mbbg():
+    """Smoke: evaluate_lbr against an untrained net should run end-to-end and
+    return a finite mbb/g (positive => trained policy is exploitable)."""
+    from algo.deep_cfr import evaluate_lbr
+    cfg = DeepCFRConfig()
+    cfg.num_players = 2
+    net = PolicyNet(obs_dim=OBS_DIM,
+                    num_actions=ActionSpace(cfg.bet_fractions).num_actions,
+                    hidden=64, num_blocks=1).to(torch.device("cpu"))
+    net.eval()
+    mbbg = evaluate_lbr(
+        net, cfg, torch.device("cpu"),
+        num_hands=20, equity_samples=20,
+        rng=random.Random(0),
+    )
+    assert np.isfinite(mbbg)
+
+
+# ---------------------------------------------------------------------------
+# Multi-way (Phase H)
+# ---------------------------------------------------------------------------
+
+def test_evaluate_vs_baselines_6max_runs():
+    """Multi-way (6-max) baseline eval must produce one mbb/g per baseline."""
+    from algo.deep_cfr import evaluate_vs_baselines
+    cfg = DeepCFRConfig()
+    cfg.num_players = 6
+    aspace = ActionSpace(cfg.bet_fractions)
+    net = PolicyNet(obs_dim=OBS_DIM, num_actions=aspace.num_actions,
+                    hidden=64, num_blocks=1).to(torch.device("cpu"))
+    net.eval()
+    out = evaluate_vs_baselines(net, cfg, torch.device("cpu"),
+                                 num_hands=24, rng=random.Random(0))
+    assert set(out.keys()) == {"random", "call_station", "tight_aggressive"}
+    for v in out.values():
+        assert np.isfinite(v)
+
+
+def test_traverse_one_3max_runs():
+    """traverse_one must work for >2 players."""
+    from algo.deep_cfr.traversal import traverse_one, make_uniform_strategy_fn
+    aspace = ActionSpace()
+    adv, strat = traverse_one(
+        traverser=0,
+        strategy_fn=make_uniform_strategy_fn(),
+        iter_t=1,
+        num_players=3,
+        starting_stack=200,
+        small_blind=1,
+        big_blind=2,
+        button=0,
+        action_space=aspace,
+        deal_rng=random.Random(0),
+        sample_rng=np.random.default_rng(1),
+        linear_weight=True,
+    )
+    assert len(adv) + len(strat) > 0
+

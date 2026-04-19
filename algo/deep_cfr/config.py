@@ -44,6 +44,11 @@ class DeepCFRConfig:
     eval_interval: int = 5
     eval_hands: int = 2000
 
+    # LBR exploitability eval (Phase G)
+    lbr_interval: int = 0              # 0 disables; otherwise compute LBR every N iters
+    lbr_hands: int = 1000
+    lbr_equity_samples: int = 100
+
     # Runtime
     device: str = "cuda"
     amp_dtype: str = "bfloat16"        # "bfloat16" | "float16" | "float32"

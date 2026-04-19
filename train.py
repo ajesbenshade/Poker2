@@ -156,6 +156,10 @@ def parse_args():
                         help="Apply torch.compile to GPU train nets")
     parser.add_argument("--cfr-async", dest="cfr_async", action="store_true",
                         help="Overlap CPU traversals with GPU training (Phase B)")
+    parser.add_argument("--cfr-lbr-interval", dest="cfr_lbr_interval", type=int, default=None,
+                        help="Compute LBR exploitability every N CFR iters (0=off)")
+    parser.add_argument("--cfr-lbr-hands", dest="cfr_lbr_hands", type=int, default=None,
+                        help="Hands per LBR evaluation")
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
 
@@ -633,6 +637,10 @@ def train_deep_cfr(args):
         cfg.use_torch_compile = True
     if args.cfr_async:
         cfg.async_pipeline = True
+    if args.cfr_lbr_interval is not None:
+        cfg.lbr_interval = int(args.cfr_lbr_interval)
+    if args.cfr_lbr_hands is not None:
+        cfg.lbr_hands = int(args.cfr_lbr_hands)
     if args.players is not None:
         cfg.num_players = int(args.players)
     if args.log_interval is not None:
