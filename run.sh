@@ -6,4 +6,13 @@ export HSA_OVERRIDE_GFX_VERSION=11.0.0
 export PYTORCH_HIP_ALLOC_CONF="garbage_collect_threshold:0.6,expandable_segment:True,max_split_size_mb:128"
 export OMP_NUM_THREADS=1
 
-exec /home/aaron/Poker2/.venv/bin/python /home/aaron/Poker2/train.py "$@"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV_PYTHON="$SCRIPT_DIR/.venv/bin/python"
+
+if [[ ! -x "$VENV_PYTHON" ]]; then
+	echo "Virtual environment not found at $VENV_PYTHON"
+	echo "Create it with: python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt"
+	exit 1
+fi
+
+exec "$VENV_PYTHON" "$SCRIPT_DIR/train.py" "$@"

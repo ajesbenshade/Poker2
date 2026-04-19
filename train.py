@@ -9,8 +9,12 @@ import sys
 os.environ.setdefault("HIP_VISIBLE_DEVICES", "0")
 os.environ.setdefault("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
 os.environ.setdefault(
-    "PYTORCH_HIP_ALLOC_CONF",
+    "PYTORCH_ALLOC_CONF",
     "expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:512",
+)
+os.environ.setdefault(
+    "PYTORCH_HIP_ALLOC_CONF",
+    os.environ["PYTORCH_ALLOC_CONF"],
 )
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", os.environ["PYTORCH_HIP_ALLOC_CONF"])
 os.environ.setdefault("PYTORCH_NO_ROCM_EXPANDABLE_SEGMENTS_WARNING", "1")
@@ -18,6 +22,7 @@ os.environ.setdefault("HSA_ENABLE_SDMA", "0")
 os.environ.setdefault("TORCH_CUDNN_ENABLE", "0")
 os.environ.setdefault("TORCH_ROCM_AOTRITON_DISABLE", "1")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 from environment import get_memory_snapshot, initialize_rocm_runtime
 
@@ -35,6 +40,15 @@ def _configure_torch_backends():
     if hasattr(torch.backends, "cudnn"):
         torch.backends.cudnn.benchmark = Config.CUDNN_BENCHMARK
         torch.backends.cudnn.deterministic = Config.CUDNN_DETERMINISTIC
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True
+        except Exception:
+            pass
 
 try:
     mp.set_start_method("forkserver", force=True)
@@ -77,16 +91,18 @@ def _parse_lmdb_map_size(value):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="PPO-first Poker2 trainer tuned for RX 7900 XT ROCm.")
-    parser.add_argument("--profile", choices=["stable", "smoke", "medium", "long-run", "custom"], default=None, help="Apply a named PPO runtime profile before individual overrides")
+    parser.add_argument("--profile", choices=["stable", "stable-plus", "smoke", "medium", "aggressive", "long-run", "custom"], default=None, help="Apply a named PPO runtime profile before individual overrides")
     parser.add_argument("--smoke-test", action="store_true", help="Run a short PPO validation profile")
     parser.add_argument("--smoke_test", dest="smoke_test_compat", nargs="?", const=True, default=None, type=_parse_optional_bool, help=argparse.SUPPRESS)
     parser.add_argument("--long-run", action="store_true", help="Run the long unattended profile")
     parser.add_argument("--long_run", dest="long_run_compat", nargs="?", const=True, default=None, type=_parse_optional_bool, help=argparse.SUPPRESS)
     parser.add_argument("--iterations", "--num-hands", "--num_hands", dest="iterations", type=int, default=None)
     parser.add_argument("--batch-size", "--batch_size", "--batch", dest="batch_size", type=int, default=None)
+    parser.add_argument("--rollout-steps", "--rollout_steps", "--rollout", dest="rollout_steps", type=int, default=None, help="Override PPO rollout size per iteration")
     parser.add_argument("--hidden-size", "--hidden_size", "--hidden", dest="hidden_size", type=int, default=None, help="Override PPO model hidden width before model construction")
     parser.add_argument("--num-simulations", "--num_simulations", "--sims", dest="num_simulations", type=int, default=None)
     parser.add_argument("--mp-processes", "--mp_processes", "--mp", dest="mp_processes", type=int, default=None, help="Override multiprocessing worker count for hand ranking")
+    parser.add_argument("--learning-rate", "--learning_rate", "--lr", dest="learning_rate", type=float, default=None, help="Override AdamW learning rate")
     parser.add_argument("--resume-checkpoint", type=str, default=None)
     parser.add_argument("--disable-amp", action="store_true")
     parser.add_argument("--amp", dest="amp_enabled", nargs="?", const=True, default=None, type=_parse_optional_bool, help="Explicitly enable or disable AMP")
@@ -113,6 +129,26 @@ def parse_args():
     parser.add_argument("--equity-train-batch-size", type=int, default=None, help="Background EquityNet batch size")
     parser.add_argument("--equity-train-validation-batches", type=int, default=None, help="Background EquityNet validation batches")
     parser.add_argument("--players", type=int, default=None, help="Pin number of opponents")
+    # --- Deep CFR options ---
+    parser.add_argument("--algo", choices=["ppo", "deep-cfr"], default="ppo",
+                        help="Training algorithm")
+    parser.add_argument("--cfr-traversals", dest="cfr_traversals", type=int, default=None,
+                        help="External-sampling traversals per player per CFR iter")
+    parser.add_argument("--cfr-hidden", dest="cfr_hidden", type=int, default=None,
+                        help="Deep CFR network hidden width")
+    parser.add_argument("--cfr-blocks", dest="cfr_blocks", type=int, default=None,
+                        help="Deep CFR network residual block count")
+    parser.add_argument("--cfr-eval-hands", dest="cfr_eval_hands", type=int, default=None,
+                        help="Hands per baseline match in Deep CFR eval")
+    parser.add_argument("--cfr-eval-interval", dest="cfr_eval_interval", type=int, default=None,
+                        help="CFR iterations between baseline evals")
+    parser.add_argument("--cfr-stack", dest="cfr_stack", type=int, default=None,
+                        help="Starting stack in chips (BB units = stack / big_blind)")
+    parser.add_argument("--cfr-adv-steps", dest="cfr_adv_steps", type=int, default=None)
+    parser.add_argument("--cfr-strat-steps", dest="cfr_strat_steps", type=int, default=None)
+    parser.add_argument("--cfr-batch-size", dest="cfr_batch_size", type=int, default=None)
+    parser.add_argument("--cfr-lr", dest="cfr_lr", type=float, default=None)
+    parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
 
 
@@ -139,9 +175,32 @@ def apply_runtime_profile(args):
         Config.BATCH_SIZE = Config.SMOKE_TEST_BATCH_SIZE
         Config.NUM_SIMULATIONS = Config.SMOKE_TEST_NUM_SIMULATIONS
         Config.ROLLOUT_STEPS = Config.SMOKE_TEST_ROLLOUT_STEPS
+        Config.ROLLOUT_SCALE_WITH_BATCH = False
+        Config.WARMUP_ENABLED = False
         Config.VALIDATION_INTERVAL = Config.SMOKE_TEST_VALIDATION_INTERVAL
         Config.LOG_INTERVAL = Config.SMOKE_TEST_LOG_INTERVAL
         Config.CHECKPOINT_INTERVAL = Config.SMOKE_TEST_CHECKPOINT_INTERVAL
+
+    if args.profile == 'stable-plus':
+        profile_name = 'stable-plus'
+        Config.ITERATIONS = Config.STABLE_PLUS_ITERATIONS
+        Config.BATCH_SIZE = Config.STABLE_PLUS_BATCH_SIZE
+        Config.NUM_SIMULATIONS = Config.STABLE_PLUS_NUM_SIMULATIONS
+        Config.MODEL_HIDDEN_DIM = Config.STABLE_PLUS_HIDDEN_DIM
+        Config.ROLLOUT_STEPS = Config.STABLE_PLUS_ROLLOUT_STEPS
+        Config.ROLLOUT_SCALE_WITH_BATCH = False
+        Config.WARMUP_ENABLED = False
+        Config.LOG_INTERVAL = Config.STABLE_PLUS_LOG_INTERVAL
+        Config.VALIDATION_INTERVAL = Config.STABLE_PLUS_VALIDATION_INTERVAL
+        Config.NUM_TRAINING_STEPS = Config.STABLE_PLUS_NUM_TRAINING_STEPS
+        Config.PPO_MINIBATCHES = Config.STABLE_PLUS_PPO_MINIBATCHES
+        Config.GRADIENT_ACCUMULATION_STEPS = Config.STABLE_PLUS_GRADIENT_ACCUMULATION_STEPS
+        Config.CACHE_CLEAR_INTERVAL_STEPS = Config.STABLE_PLUS_CACHE_CLEAR_INTERVAL_STEPS
+        Config.GRADIENT_CHECKPOINTING = Config.STABLE_PLUS_GRADIENT_CHECKPOINTING
+        Config.MCTS_MAX_DEPTH = Config.STABLE_PLUS_MCTS_DEPTH
+        Config.PPO_REPLAY_ENABLED = Config.STABLE_PLUS_PPO_REPLAY_ENABLED
+        Config.VRAM_SOFT_LIMIT_GB = Config.STABLE_PLUS_VRAM_SOFT_LIMIT_GB
+        Config.MP_PROCESSES = Config.STABLE_PLUS_MP_PROCESSES
 
     if args.profile == 'medium':
         profile_name = 'medium'
@@ -149,6 +208,9 @@ def apply_runtime_profile(args):
         Config.BATCH_SIZE = Config.MEDIUM_RUN_BATCH_SIZE
         Config.NUM_SIMULATIONS = Config.MEDIUM_RUN_NUM_SIMULATIONS
         Config.MODEL_HIDDEN_DIM = Config.MEDIUM_RUN_HIDDEN_DIM
+        Config.ROLLOUT_STEPS = Config.MEDIUM_RUN_ROLLOUT_STEPS
+        Config.ROLLOUT_SCALE_WITH_BATCH = False
+        Config.WARMUP_ENABLED = False
         Config.LOG_INTERVAL = Config.MEDIUM_RUN_LOG_INTERVAL
         Config.VALIDATION_INTERVAL = Config.MEDIUM_RUN_VALIDATION_INTERVAL
         Config.NUM_TRAINING_STEPS = Config.MEDIUM_RUN_NUM_TRAINING_STEPS
@@ -165,6 +227,43 @@ def apply_runtime_profile(args):
         Config.EQUITY_TRAIN_INTERVAL = Config.MEDIUM_RUN_EQUITY_TRAIN_INTERVAL
         Config.MP_PROCESSES = Config.MEDIUM_RUN_MP_PROCESSES
 
+    if args.profile == 'aggressive':
+        profile_name = 'aggressive'
+        Config.ITERATIONS = Config.AGGRESSIVE_RUN_ITERATIONS
+        Config.BATCH_SIZE = Config.AGGRESSIVE_RUN_BATCH_SIZE
+        Config.NUM_SIMULATIONS = Config.AGGRESSIVE_RUN_NUM_SIMULATIONS
+        Config.MODEL_HIDDEN_DIM = Config.AGGRESSIVE_RUN_HIDDEN_DIM
+        Config.ROLLOUT_STEPS = Config.AGGRESSIVE_RUN_ROLLOUT_STEPS
+        Config.ROLLOUT_SCALE_WITH_BATCH = Config.AGGRESSIVE_RUN_ROLLOUT_SCALE_WITH_BATCH
+        Config.MAX_ROLLOUT_STEPS = Config.AGGRESSIVE_RUN_MAX_ROLLOUT_STEPS
+        Config.LOG_INTERVAL = Config.AGGRESSIVE_RUN_LOG_INTERVAL
+        Config.VALIDATION_INTERVAL = Config.AGGRESSIVE_RUN_VALIDATION_INTERVAL
+        Config.NUM_TRAINING_STEPS = Config.AGGRESSIVE_RUN_NUM_TRAINING_STEPS
+        Config.GRADIENT_ACCUMULATION_STEPS = Config.AGGRESSIVE_RUN_GRADIENT_ACCUMULATION_STEPS
+        Config.REPLAY_BUFFER_SIZE = Config.AGGRESSIVE_RUN_REPLAY_BUFFER_SIZE
+        Config.LMDB_MAP_SIZE_GB = Config.AGGRESSIVE_RUN_LMDB_MAP_SIZE_GB
+        Config.LEARNING_RATE = Config.AGGRESSIVE_RUN_LEARNING_RATE
+        Config.ENTROPY_COEF = Config.AGGRESSIVE_RUN_ENTROPY_COEF
+        Config.ENTROPY_FINAL_COEF = Config.AGGRESSIVE_RUN_ENTROPY_FINAL_COEF
+        Config.ENTROPY_DECAY_ITERS = Config.AGGRESSIVE_RUN_ENTROPY_DECAY_ITERS
+        Config.POPULATION_MIX_PROB = Config.AGGRESSIVE_RUN_POPULATION_MIX_PROB
+        Config.MCTS_MAX_DEPTH = Config.AGGRESSIVE_RUN_MCTS_DEPTH
+        Config.MCTS_TRIGGER_PROB = Config.AGGRESSIVE_RUN_MCTS_TRIGGER_PROB
+        Config.PPO_REPLAY_ENABLED = Config.AGGRESSIVE_RUN_PPO_REPLAY_ENABLED
+        Config.VALUE_CLIP_ENABLED = Config.AGGRESSIVE_RUN_VALUE_CLIP_ENABLED
+        Config.EQUITY_TRAIN_INTERVAL = Config.AGGRESSIVE_RUN_EQUITY_TRAIN_INTERVAL
+        Config.MP_PROCESSES = Config.AGGRESSIVE_RUN_MP_PROCESSES
+        Config.PPO_MINIBATCHES = Config.AGGRESSIVE_RUN_PPO_MINIBATCHES
+        Config.GRADIENT_CHECKPOINTING = Config.AGGRESSIVE_RUN_GRADIENT_CHECKPOINTING
+        Config.USE_TORCH_COMPILE = Config.AGGRESSIVE_RUN_USE_TORCH_COMPILE
+        Config.VRAM_SOFT_LIMIT_GB = Config.AGGRESSIVE_RUN_VRAM_SOFT_LIMIT_GB
+        Config.RAM_SOFT_LIMIT_PCT = Config.AGGRESSIVE_RUN_RAM_SOFT_LIMIT_PCT
+        Config.WARMUP_ENABLED = True
+        Config.WARMUP_TOTAL_ITERS = Config.AGGRESSIVE_WARMUP_ITERS
+        Config.WARMUP_MIN_ROLLOUT_STEPS = Config.AGGRESSIVE_WARMUP_MIN_ROLLOUT_STEPS
+        Config.WARMUP_MIN_NUM_SIMULATIONS = Config.AGGRESSIVE_WARMUP_MIN_NUM_SIMULATIONS
+        Config.WARMUP_MIN_TRAINING_STEPS = Config.AGGRESSIVE_WARMUP_MIN_TRAINING_STEPS
+
     if args.profile == 'long-run' or long_run_selected:
         profile_name = 'long-run'
         Config.ITERATIONS = Config.LONG_RUN_ITERATIONS
@@ -175,11 +274,17 @@ def apply_runtime_profile(args):
     if args.batch_size is not None:
         Config.BATCH_SIZE = args.batch_size
         custom_overrides = True
+    if args.rollout_steps is not None:
+        Config.ROLLOUT_STEPS = max(1, int(args.rollout_steps))
+        custom_overrides = True
     if args.hidden_size is not None:
         Config.MODEL_HIDDEN_DIM = max(128, int(args.hidden_size))
         custom_overrides = True
     if args.num_simulations is not None:
         Config.NUM_SIMULATIONS = args.num_simulations
+        custom_overrides = True
+    if args.learning_rate is not None:
+        Config.LEARNING_RATE = max(1e-7, float(args.learning_rate))
         custom_overrides = True
     if args.mp_processes is not None:
         Config.MP_PROCESSES = max(1, int(args.mp_processes))
@@ -284,6 +389,7 @@ def apply_runtime_profile(args):
         Config.AMP_DTYPE = torch.float32
     _configure_torch_backends()
     Config.RECOVERY_BATCH_CAP = Config.BATCH_SIZE
+    Config.NUM_SIMS = Config.NUM_SIMULATIONS
     Config.PRESSURE_SIMULATION_CAP = Config.NUM_SIMULATIONS
     Config.RECOVERY_SIMULATION_CAP = Config.NUM_SIMULATIONS
     torch.set_num_threads(Config.TORCH_NUM_THREADS)
@@ -298,7 +404,7 @@ def _log_startup(args):
     if ROCM_STARTUP_INFO.get("probe_error"):
         logger.warning("ROCm probe error: %s", ROCM_STARTUP_INFO["probe_error"])
     logger.info(
-        "profile=%s | smoke=%s | iterations=%s | rollout=%s | batch=%s | hidden=%s | sims=%s | mp=%s | train_steps=%s | amp=%s | amp_dtype=%s | replay=%s | entropy=%.4f -> %.4f/%s | value_clip=%s | mcts_depth=%s",
+        "profile=%s | smoke=%s | iterations=%s | rollout=%s | batch=%s | hidden=%s | sims=%s | mp=%s | train_steps=%s | amp=%s | amp_dtype=%s | replay=%s | entropy=%.4f -> %.4f/%s | value_clip=%s | mcts_depth=%s | warmup=%s/%s",
         Config.RUNTIME_PROFILE,
         args.smoke_test,
         Config.ITERATIONS,
@@ -316,6 +422,8 @@ def _log_startup(args):
         Config.ENTROPY_DECAY_ITERS,
         Config.VALUE_CLIP_ENABLED,
         Config.MCTS_MAX_DEPTH,
+        int(getattr(Config, "WARMUP_ENABLED", False)),
+        int(getattr(Config, "WARMUP_TOTAL_ITERS", 0)),
     )
     logger.info(
         "memory: vram %.2f/%.2f GB (%.1f%%) | ram %.1f%% | vram soft limit %.1f GB | lmdb map %s GB | replay cap %s",
@@ -328,13 +436,14 @@ def _log_startup(args):
         Config.REPLAY_BUFFER_SIZE,
     )
     logger.info(
-        "ROCm env: HIP_VISIBLE_DEVICES=%s | HSA_OVERRIDE_GFX_VERSION=%s | PYTORCH_ALLOC_CONF=%s | HSA_ENABLE_SDMA=%s | TORCH_CUDNN_ENABLE=%s | OMP_NUM_THREADS=%s",
+        "ROCm env: HIP_VISIBLE_DEVICES=%s | HSA_OVERRIDE_GFX_VERSION=%s | PYTORCH_ALLOC_CONF=%s | HSA_ENABLE_SDMA=%s | TORCH_CUDNN_ENABLE=%s | OMP_NUM_THREADS=%s | MKL_NUM_THREADS=%s",
         os.environ.get("HIP_VISIBLE_DEVICES", "0"),
         os.environ.get("HSA_OVERRIDE_GFX_VERSION", "11.0.0"),
         os.environ.get("PYTORCH_ALLOC_CONF", ""),
         os.environ.get("HSA_ENABLE_SDMA", "0"),
         os.environ.get("TORCH_CUDNN_ENABLE", "0"),
         os.environ.get("OMP_NUM_THREADS", "1"),
+        os.environ.get("MKL_NUM_THREADS", "1"),
     )
 
 
@@ -442,7 +551,9 @@ def train_ppo(args):
                     "vram_used_gb": metrics["vram_used_gb"],
                     "vram_pct": metrics["vram_pct"],
                     "batch_size": metrics["batch_size"],
+                    "rollout_steps": metrics["rollout_steps"],
                     "simulations": metrics["simulations"],
+                    "training_steps": metrics["training_steps"],
                     "num_opponents": metrics["num_opponents"],
                     "mcts_rate": metrics["mcts_rate"],
                     "population_rate": metrics["population_rate"],
@@ -451,7 +562,7 @@ def train_ppo(args):
 
             if agent.iteration % Config.LOG_INTERVAL == 0:
                 logger.info(
-                    "iter %s | reward %.4f | elo %.1f | loss %.4f | entropy_coef %.4f | vram %.2f GB | ram %.1f%% | batch %s | sims %s | players %s | mcts %.2f | pop %.2f | backoff %s",
+                    "iter %s | reward %.4f | elo %.1f | loss %.4f | entropy_coef %.4f | vram %.2f GB | ram %.1f%% | batch %s | rollout %s | sims %s | train_steps %s | players %s | mcts %.2f | pop %.2f | backoff %s",
                     agent.iteration,
                     metrics["avg_reward"],
                     metrics["elo"],
@@ -460,7 +571,9 @@ def train_ppo(args):
                     metrics["vram_used_gb"],
                     metrics["ram_pct"],
                     metrics["batch_size"],
+                    metrics["rollout_steps"],
                     metrics["simulations"],
+                    metrics["training_steps"],
                     metrics["num_opponents"],
                     metrics["mcts_rate"],
                     metrics["population_rate"],
@@ -478,8 +591,60 @@ def train_ppo(args):
         writer.close()
 
 
+def train_deep_cfr(args):
+    from algo.deep_cfr import DeepCFRConfig, DeepCFRTrainer
+
+    cfg = DeepCFRConfig()
+    if args.iterations is not None:
+        cfg.num_iterations = int(args.iterations)
+    if args.cfr_traversals is not None:
+        cfg.traversals_per_iter = int(args.cfr_traversals)
+    if args.cfr_hidden is not None:
+        cfg.hidden_size = int(args.cfr_hidden)
+    if args.cfr_blocks is not None:
+        cfg.num_blocks = int(args.cfr_blocks)
+    if args.cfr_eval_hands is not None:
+        cfg.eval_hands = int(args.cfr_eval_hands)
+    if args.cfr_eval_interval is not None:
+        cfg.eval_interval = int(args.cfr_eval_interval)
+    if args.cfr_stack is not None:
+        cfg.starting_stack = int(args.cfr_stack)
+    if args.cfr_adv_steps is not None:
+        cfg.advantage_train_steps = int(args.cfr_adv_steps)
+    if args.cfr_strat_steps is not None:
+        cfg.strategy_train_steps = int(args.cfr_strat_steps)
+    if args.cfr_batch_size is not None:
+        cfg.train_batch_size = int(args.cfr_batch_size)
+    if args.cfr_lr is not None:
+        cfg.learning_rate = float(args.cfr_lr)
+    if args.players is not None:
+        cfg.num_players = int(args.players)
+    if args.log_interval is not None:
+        cfg.log_interval = int(args.log_interval)
+    if args.amp_dtype is not None:
+        cfg.amp_dtype = (
+            "bfloat16" if args.amp_dtype in ("auto", "bf16", "bfloat16")
+            else "float16" if args.amp_dtype in ("fp16", "float16") else "float32"
+        )
+    cfg.seed = int(args.seed)
+
+    logger.info(
+        "DEEP CFR | players=%d | iters=%d | traversals/iter/p=%d | hidden=%d | blocks=%d | "
+        "stack=%d (%d BB) | adv_steps=%d | strat_steps=%d | bs=%d | lr=%.4g | eval_every=%d (%d hands) | seed=%d",
+        cfg.num_players, cfg.num_iterations, cfg.traversals_per_iter,
+        cfg.hidden_size, cfg.num_blocks, cfg.starting_stack,
+        cfg.starting_stack // cfg.big_blind, cfg.advantage_train_steps,
+        cfg.strategy_train_steps, cfg.train_batch_size, cfg.learning_rate,
+        cfg.eval_interval, cfg.eval_hands, cfg.seed,
+    )
+    DeepCFRTrainer(cfg).train()
+
+
 def main():
     args = parse_args()
+    if args.algo == "deep-cfr":
+        train_deep_cfr(args)
+        return
     apply_runtime_profile(args)
     _log_startup(args)
     train_ppo(args)

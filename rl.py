@@ -10,7 +10,7 @@ from torch.amp import GradScaler
 
 from config import Config
 from datatypes import Action, Infoset
-from environment import clear_runtime_caches, get_memory_snapshot
+from environment import clear_runtime_caches, get_memory_snapshot, get_vram_usage
 from game import simulate_action_batch, terminal
 from models import ActorCriticModel, CustomBeta
 from storage import Float16ReservoirBuffer
@@ -177,6 +177,12 @@ class ActorCriticAgent:
     def __init__(self, writer=None):
         self.device = Config.DEVICE
         self.writer = writer
+        if self.device == "cuda" and torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats()
+            except Exception:
+                pass
         self.model = ActorCriticModel(
             state_dim=Config.STATE_DIM,
             num_actions=Config.NUM_ACTIONS,
@@ -214,7 +220,24 @@ class ActorCriticAgent:
         self.num_opponents = Config.START_OPPONENTS
         self.opponent_model = OpponentModel()
         self.elo_tracker = EloTracker(k_factor=Config.ELO_K_FACTOR)
-        self.population = PopulationManager(self.model.state_dict())
+        self.population = PopulationManager(self._model_state_dict())
+
+        if getattr(Config, "USE_TORCH_COMPILE", False) and self.device == "cuda":
+            try:
+                compile_mode = "default" if getattr(torch.version, "hip", None) else "reduce-overhead"
+                self.model = torch.compile(self.model, mode=compile_mode, fullgraph=False)
+                logger.info("torch.compile enabled on ActorCriticModel (mode=%s)", compile_mode)
+            except Exception as exc:  # pragma: no cover - ROCm compile can fail
+                logger.warning("torch.compile failed (%s); continuing uncompiled", exc)
+
+    def _base_model(self):
+        return getattr(self.model, "_orig_mod", self.model)
+
+    def _model_state_dict(self):
+        return self._base_model().state_dict()
+
+    def _load_model_state_dict(self, state_dict, strict=True):
+        self._base_model().load_state_dict(state_dict, strict=strict)
 
     def _state_from_infoset(self, infoset):
         state = np.zeros(Config.STATE_DIM, dtype=np.float32)
@@ -258,6 +281,62 @@ class ActorCriticAgent:
         action_values = self._mcts_action_values(infoset, Config.MCTS_MAX_DEPTH)
         return int(np.argmax(action_values))
 
+    def _warmup_progress(self):
+        if not getattr(Config, "WARMUP_ENABLED", False):
+            return 1.0
+        total_iters = max(1, int(getattr(Config, "WARMUP_TOTAL_ITERS", 0)))
+        if total_iters <= 0:
+            return 1.0
+        return min(1.0, max(0.0, self.iteration / total_iters))
+
+    def _ramp_int(self, minimum, maximum):
+        minimum = int(minimum)
+        maximum = int(maximum)
+        if maximum <= minimum:
+            return maximum
+        progress = self._warmup_progress()
+        return int(round(minimum + (maximum - minimum) * progress))
+
+    def _current_rollout_steps(self):
+        target_rollout_steps = max(1, int(getattr(Config, "ROLLOUT_STEPS", self.current_batch_size)))
+        if getattr(Config, "ROLLOUT_SCALE_WITH_BATCH", False):
+            max_rollout_steps = max(target_rollout_steps, int(getattr(Config, "MAX_ROLLOUT_STEPS", target_rollout_steps)))
+            target_rollout_steps = max(target_rollout_steps, min(self.current_batch_size, max_rollout_steps))
+        minimum_rollout_steps = max(1, int(getattr(Config, "WARMUP_MIN_ROLLOUT_STEPS", target_rollout_steps)))
+        rollout_steps = self._ramp_int(minimum_rollout_steps, target_rollout_steps)
+        if self.device == "cuda":
+            snapshot = get_memory_snapshot()
+            vram_soft_limit = float(getattr(Config, "VRAM_SOFT_LIMIT_GB", 0.0) or 0.0)
+            if vram_soft_limit > 0.0:
+                headroom_trigger = vram_soft_limit * 0.80
+                if snapshot["used_gb"] >= headroom_trigger:
+                    vram_window = max(vram_soft_limit - headroom_trigger, 0.5)
+                    remaining = max(vram_soft_limit - snapshot["used_gb"], 0.0)
+                    scale = max(0.25, min(1.0, remaining / vram_window))
+                    rollout_steps = max(minimum_rollout_steps, int(rollout_steps * scale))
+        return rollout_steps
+
+    def _current_training_steps(self):
+        base_training_steps = max(1, int(getattr(Config, "NUM_TRAINING_STEPS", Config.PPO_EPOCHS)))
+        minimum_training_steps = max(1, int(getattr(Config, "WARMUP_MIN_TRAINING_STEPS", base_training_steps)))
+        training_steps = self._ramp_int(minimum_training_steps, base_training_steps)
+        if self.device == "cuda":
+            snapshot = get_memory_snapshot()
+            vram_soft_limit = float(getattr(Config, "VRAM_SOFT_LIMIT_GB", 0.0) or 0.0)
+            if vram_soft_limit > 0.0:
+                headroom_trigger = vram_soft_limit * 0.80
+                if snapshot["used_gb"] >= headroom_trigger:
+                    vram_window = max(vram_soft_limit - headroom_trigger, 0.5)
+                    remaining = max(vram_soft_limit - snapshot["used_gb"], 0.0)
+                    scale = max(0.25, min(1.0, remaining / vram_window))
+                    training_steps = max(minimum_training_steps, int(training_steps * scale))
+        return training_steps
+
+    def _current_effective_simulations(self):
+        base_simulations = max(1, int(self.current_simulations))
+        minimum_simulations = max(1, int(getattr(Config, "WARMUP_MIN_NUM_SIMULATIONS", base_simulations)))
+        return self._ramp_int(minimum_simulations, base_simulations)
+
     def _make_child_infoset(self, infoset, action, branch_index):
         next_history = infoset.history + (action.value,)
         next_bucket = (infoset.key[0] * 131 + action.value * 17 + branch_index * 29 + len(next_history) * 7) % 4096
@@ -269,7 +348,7 @@ class ActorCriticAgent:
         if depth <= 1:
             return np.asarray(immediate_values, dtype=np.float32)
 
-        branch_count = max(1, min(Config.MCTS_BRANCHING, max(1, self.current_simulations // 128)))
+        branch_count = max(1, min(Config.MCTS_BRANCHING, max(1, self._current_effective_simulations() // 128)))
         scored_values = []
         for action_index, action in enumerate(actions):
             child_values = []
@@ -344,6 +423,12 @@ class ActorCriticAgent:
         )
         Config.BATCH_SIZE = self.current_batch_size
         Config.NUM_SIMULATIONS = self.current_simulations
+        clear_runtime_caches()
+        if self.device == "cuda":
+            try:
+                torch.cuda.reset_peak_memory_stats()
+            except Exception:
+                pass
         snapshot = get_memory_snapshot()
         logger.warning(
             "recoverable runtime error at iter %s: %s | batch %s -> %s | sims %s -> %s | vram %.2f GB | ram %.1f%%",
@@ -364,6 +449,7 @@ class ActorCriticAgent:
         snapshot = get_memory_snapshot()
         mcts_vram_disable_gb = float(getattr(Config, "MCTS_VRAM_DISABLE_GB", Config.VRAM_SOFT_LIMIT_GB * 0.93))
         mcts_enabled_for_snapshot = snapshot["used_gb"] < mcts_vram_disable_gb
+        mcts_budget = max(0, int(getattr(Config, "MCTS_MAX_ACTIVE", len(infosets))))
         population_rate = 0.0
         active_model = self.model
         if not deterministic and Config.POPULATION_MIX_PROB > 0.0 and np.random.random() < Config.POPULATION_MIX_PROB:
@@ -403,11 +489,12 @@ class ActorCriticAgent:
 
             use_mcts = (
                 mcts_enabled_for_snapshot
+                and mcts_count < mcts_budget
                 and
                 Config.MCTS_MAX_DEPTH > 0
                 and
                 equities[idx] > Config.MCTS_EQUITY_THRESHOLD
-                and np.random.random() < Config.MCTS_TRIGGER_PROB
+                and np.random.random() < float(getattr(Config, "MCTS_TRIGGER_PROB", 0.15))
                 and not deterministic
             )
             if use_mcts:
@@ -422,16 +509,18 @@ class ActorCriticAgent:
         return actions, log_probs, values.float(), raise_fracs.float(), mcts_count / max(1, len(infosets)), population_rate
 
     def _compute_gae(self, rewards, values):
-        returns = torch.zeros_like(rewards)
-        advantages = torch.zeros_like(rewards)
-        next_adv = torch.tensor(0.0, device=rewards.device)
-        next_value = torch.tensor(0.0, device=rewards.device)
-        for t in reversed(range(rewards.shape[0])):
-            delta = rewards[t] + Config.GAMMA * next_value - values[t]
+        rewards_f = rewards.float()
+        values_f = values.float()
+        returns = torch.zeros_like(rewards_f)
+        advantages = torch.zeros_like(rewards_f)
+        next_adv = torch.tensor(0.0, dtype=torch.float32, device=rewards.device)
+        next_value = torch.tensor(0.0, dtype=torch.float32, device=rewards.device)
+        for t in reversed(range(rewards_f.shape[0])):
+            delta = rewards_f[t] + Config.GAMMA * next_value - values_f[t]
             next_adv = delta + Config.GAMMA * Config.GAE_LAMBDA * next_adv
             advantages[t] = next_adv
-            returns[t] = advantages[t] + values[t]
-            next_value = values[t]
+            returns[t] = advantages[t] + values_f[t]
+            next_value = values_f[t]
 
         std = advantages.std().clamp(min=1e-6)
         advantages = (advantages - advantages.mean()) / std
@@ -447,7 +536,8 @@ class ActorCriticAgent:
         return torch.clamp(utilities, min=-4.0, max=4.0)
 
     def collect_rollout(self):
-        infosets = self._sample_infosets(Config.ROLLOUT_STEPS)
+        rollout_steps = self._current_rollout_steps()
+        infosets = self._sample_infosets(rollout_steps)
         actions, log_probs, values, raise_fracs, mcts_rate, population_rate = self.choose_action(infosets, deterministic=False)
         rewards = self._simulate_rewards(infosets, actions, raise_fracs)
         returns, advantages = self._compute_gae(rewards, values.detach())
@@ -477,7 +567,22 @@ class ActorCriticAgent:
     def _ppo_update(self, rollout):
         num_samples = rollout.states.shape[0]
         mini_size = max(1, num_samples // Config.PPO_MINIBATCHES)
-        num_training_steps = max(1, int(getattr(Config, "NUM_TRAINING_STEPS", Config.PPO_EPOCHS)))
+        vram_soft_limit = float(getattr(Config, "VRAM_SOFT_LIMIT_GB", 0.0) or 0.0)
+        pressure_trigger = vram_soft_limit * 0.92 if vram_soft_limit > 0.0 else 0.0
+        if vram_soft_limit > 0.0 and self.device == "cuda":
+            try:
+                vram_used = float(get_vram_usage().get("used_gb", 0.0))
+            except Exception:
+                vram_used = 0.0
+            if vram_used > vram_soft_limit - 1.0:
+                reduced = max(1, mini_size // 2)
+                if reduced < mini_size:
+                    logger.warning(
+                        "VRAM %.2fGB near soft limit %.2fGB; halving PPO mini_size %d -> %d",
+                        vram_used, vram_soft_limit, mini_size, reduced,
+                    )
+                    mini_size = reduced
+        num_training_steps = self._current_training_steps()
         grad_accum_steps = max(1, int(getattr(Config, "GRADIENT_ACCUMULATION_STEPS", 1)))
         cache_clear_interval = int(getattr(Config, "CACHE_CLEAR_INTERVAL_STEPS", 0))
         optimizer_step_count = 0
@@ -487,7 +592,7 @@ class ActorCriticAgent:
         entropies = []
 
         for _ in range(num_training_steps):
-            permutation = torch.randperm(num_samples, device=self.device)
+            permutation = torch.randperm(num_samples)
             accum_counter = 0
             self.optimizer.zero_grad(set_to_none=True)
             for start in range(0, num_samples, mini_size):
@@ -537,11 +642,25 @@ class ActorCriticAgent:
                     optimizer_step_count += 1
                     if cache_clear_interval > 0 and optimizer_step_count % cache_clear_interval == 0:
                         clear_runtime_caches()
+                    elif pressure_trigger > 0.0 and self.device == "cuda":
+                        snapshot = get_memory_snapshot()
+                        if snapshot["used_gb"] >= pressure_trigger:
+                            clear_runtime_caches()
 
                 losses.append(float(loss.detach().item()))
                 policy_losses.append(float(policy_loss.detach().item()))
                 value_losses.append(float(value_loss.detach().item()))
                 entropies.append(float(entropy.detach().item()))
+
+                del idx, states, actions, old_log_probs, old_values, returns, advantages, raise_fracs
+                del logits, values, alpha, beta, probs, dist, log_probs, entropy, beta_dist, raise_log_prob
+                del ratio, clipped, policy_loss, value_loss, loss
+
+            del permutation
+            if pressure_trigger > 0.0 and self.device == "cuda":
+                snapshot = get_memory_snapshot()
+                if snapshot["used_gb"] >= pressure_trigger:
+                    clear_runtime_caches()
 
         return {
             "loss": float(np.mean(losses)) if losses else 0.0,
@@ -578,7 +697,7 @@ class ActorCriticAgent:
         payload = {
             "mode": "ppo",
             "iteration": iteration,
-            "model": self.model.state_dict(),
+            "model": self._model_state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "scaler": self.scaler.state_dict(),
             "metrics": metrics,
@@ -613,7 +732,7 @@ class ActorCriticAgent:
                 f"Checkpoint hidden size {checkpoint_hidden_dim} does not match current config {Config.MODEL_HIDDEN_DIM}. "
                 "Use --hidden-size to match the checkpoint or start a fresh run."
             )
-        self.model.load_state_dict(state["model"])
+        self._load_model_state_dict(state["model"])
         self.optimizer.load_state_dict(state["optimizer"])
         self.scaler.load_state_dict(state.get("scaler", {}))
         self.current_batch_size = int(state.get("batch_size", self.current_batch_size))
@@ -656,11 +775,43 @@ class ActorCriticAgent:
         Config.BATCH_SIZE = self.current_batch_size
         Config.NUM_SIMULATIONS = self.current_simulations
 
+        if self.device == "cuda":
+            snapshot = get_memory_snapshot()
+            preemptive_vram_limit = float(getattr(Config, "VRAM_SOFT_LIMIT_GB", 0.0) or 0.0) * 0.80
+            preemptive_ram_limit = float(getattr(Config, "RAM_SOFT_LIMIT_PCT", 100.0)) - 10.0
+            if snapshot["used_gb"] >= preemptive_vram_limit or snapshot["ram_pct"] >= preemptive_ram_limit:
+                adaptation = adapt_batch_and_sims(
+                    Config,
+                    self.current_batch_size,
+                    self.current_simulations,
+                    force_backoff=True,
+                    reason_override="preemptive-backoff",
+                    recovery_on_cooldown=True,
+                )
+                self.current_batch_size = adaptation.batch_size
+                self.current_simulations = adaptation.simulations
+                Config.BATCH_SIZE = self.current_batch_size
+                Config.NUM_SIMULATIONS = self.current_simulations
+                clear_runtime_caches()
+                logger.warning(
+                    "preemptive memory backoff before iter %s | vram %.2f GB | ram %.1f%% | batch -> %s | sims -> %s",
+                    self.iteration + 1,
+                    snapshot["used_gb"],
+                    snapshot["ram_pct"],
+                    self.current_batch_size,
+                    self.current_simulations,
+                )
+
         try:
             rollout, mcts_rate, population_rate = self.collect_rollout()
             rollout = self._validate_rollout(rollout)
             metrics = self._ppo_update(rollout)
             avg_reward = float(rollout.rewards.mean().item())
+            del rollout
+            if self.device == "cuda":
+                snapshot = get_memory_snapshot()
+                if snapshot["used_gb"] >= float(getattr(Config, "VRAM_SOFT_LIMIT_GB", 0.0) or 0.0) * 0.90:
+                    clear_runtime_caches()
         except RuntimeError as runtime_error:
             if not self._is_recoverable_runtime_error(runtime_error):
                 raise
@@ -680,7 +831,9 @@ class ActorCriticAgent:
                 "vram_used_gb": snapshot["used_gb"],
                 "vram_pct": snapshot["used_pct"],
                 "batch_size": self.current_batch_size,
-                "simulations": self.current_simulations,
+                "rollout_steps": self._current_rollout_steps(),
+                "simulations": self._current_effective_simulations(),
+                "training_steps": self._current_training_steps(),
                 "num_opponents": self.num_opponents,
                 "mcts_rate": 0.0,
                 "population_rate": 0.0,
@@ -689,7 +842,7 @@ class ActorCriticAgent:
 
         if self.iteration % Config.VALIDATION_INTERVAL == 0:
             win_rate, elo = self._validate_vs_baseline()
-            self.population.refresh_anchor(self.model.state_dict())
+            self.population.refresh_anchor(self._model_state_dict())
             self.maybe_evolve_population(elo)
         else:
             win_rate, elo = 0.0, self.elo_tracker.rating
@@ -705,7 +858,9 @@ class ActorCriticAgent:
                 "vram_used_gb": snapshot["used_gb"],
                 "vram_pct": snapshot["used_pct"],
                 "batch_size": self.current_batch_size,
-                "simulations": self.current_simulations,
+                "rollout_steps": self._current_rollout_steps(),
+                "simulations": self._current_effective_simulations(),
+                "training_steps": self._current_training_steps(),
                 "num_opponents": self.num_opponents,
                 "mcts_rate": mcts_rate,
                 "population_rate": population_rate,

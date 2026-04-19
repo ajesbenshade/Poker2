@@ -17,7 +17,8 @@ echo "  HSA_OVERRIDE_GFX_VERSION=$HSA_OVERRIDE_GFX_VERSION"
 echo "  PYTORCH_HIP_ALLOC_CONF=$PYTORCH_HIP_ALLOC_CONF"
 
 # Step 2: Activate Python environment
-source /home/aaron/Poker2/.venv/bin/activate
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/.venv/bin/activate"
 
 # Step 3: Run quick test (skip Ray for stability in validation)
 echo ""

@@ -20,7 +20,7 @@ Use `PYTORCH_ALLOC_CONF`, not `PYTORCH_HIP_ALLOC_CONF`. The current default conf
 
 ## Precision and Safety
 
-`torch.set_default_dtype(torch.float32)` remains the safe baseline. PPO AMP is enabled on ROCm, and `select_amp_dtype()` prefers bf16 when supported, otherwise falls back to fp16. Any tensor exported to NumPy must cast through `.float().numpy()` first.
+`torch.set_default_dtype(torch.float32)` remains the safe baseline. PPO AMP is enabled on ROCm, and the default trainer configuration now prefers bf16 when supported, otherwise falls back to fp16. Any tensor exported to NumPy must cast through `.float().numpy()` first.
 
 ## Validated PPO Run Shape
 
@@ -37,6 +37,12 @@ The currently validated fast path on this hardware is:
 
 This path completed with stable ROCm startup, no fallback, and peak VRAM around 9 GB.
 
+## Important Throughput Note
+
+On the PPO path, `ROLLOUT_STEPS` is the main per-iteration workload knob. Raising `BATCH_SIZE` alone does not substantially increase GPU occupancy unless rollout size is also increased. The trainer now exposes `--rollout-steps` and an `aggressive` profile that can scale rollout size with the active batch cap.
+
+The aggressive profile also uses an iteration-based warm-up ramp. During the first 5k iterations it starts from a lower effective rollout, simulation count, and PPO update depth, then ramps toward the configured aggressive targets. This keeps early training stable while still allowing the 7900 XT to fill out later in the run.
+
 ## Scaling Guidance
 
 The next scale-up to test is:
@@ -51,6 +57,14 @@ The next scale-up to test is:
 Use the new CLI override to sweep PPO update depth directly:
 
 `python train.py --profile medium --batch 16384 --hidden 4096 --sims 32 --mp 20 --train-steps 16 --amp true --amp-dtype bf16 --replay true --mcts_max_depth 0`
+
+For a higher-throughput ROCm run that increases actual PPO rollout work instead of only the logged batch cap:
+
+`python train.py --profile aggressive --amp-dtype bf16 --rollout-steps 2048`
+
+For the updated hardware-tuned aggressive baseline on the 7900X + 7900 XT rig:
+
+`python train.py --profile aggressive --amp-dtype bf16 --rollout-steps 1024 --hidden-size 4096 --batch-size 16384 --num-simulations 1024 --train-steps 64 --iterations 10000`
 
 ## Monitoring
 
