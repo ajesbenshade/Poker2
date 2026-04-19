@@ -1,27 +1,19 @@
-"""External-sampling MCCFR traversal driven by neural advantage networks.
+"""External-sampling MCCFR traversal.
 
-For each Deep CFR iteration ``t`` and each traverser player ``p``, we run
-``traversals_per_iter`` independent traversals of randomly dealt hands.
-Within a traversal:
+Refactored to be **device- and buffer-agnostic**: ``traverse_one`` takes a
+``strategy_fn(obs, legal, seat) -> probs`` callable and accumulates samples
+into Python lists, which the caller turns into numpy arrays for bulk
+insertion into the appropriate :class:`ReservoirBuffer`. That decouples the
+recursive game-tree walk from torch / device / locking concerns and lets us
+run many traversals in parallel worker processes (no GPU access required).
 
-* At a node where ``p`` is to act, recurse on **every legal action** to
-  compute counterfactual values ``v(I, a)``. The instantaneous regret
-  ``r(I, a) = v(I, a) - sum_a sigma(a) * v(I, a)`` is added to ``p``'s
-  advantage buffer.
-* At a node where the opponent is to act, **sample one action** from their
-  current strategy ``sigma_o`` (computed via regret matching on the
-  opponent's advantage net) and recurse only on that branch. Also push the
-  full opponent strategy distribution into the strategy buffer.
-* Chance is already baked into ``new_hand`` (cards are dealt up-front).
-
-The instantaneous regret samples are weighted by the current iteration ``t``
-when ``linear_cfr=True`` (Linear CFR; Brown & Sandholm 2019), which
-empirically converges faster.
+Backward-compatible :func:`external_sampling` is preserved as a serial
+wrapper that constructs a strategy_fn from the passed advantage nets.
 """
 from __future__ import annotations
 
 import random
-from typing import List, Optional
+from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -34,11 +26,10 @@ from engine import (
     apply_action,
     payoffs,
 )
-from engine.encoder import OBS_DIM
 from engine.actions import ActionSpace
 
 from .buffer import ReservoirBuffer
-from .network import AdvantageNet, PolicyNet
+from .network import AdvantageNet
 
 
 # ---------------------------------------------------------------------------
@@ -55,55 +46,75 @@ def regret_matching(advantages: np.ndarray, legal: np.ndarray) -> np.ndarray:
     total = pos.sum()
     if total > 0:
         return pos / total
-    # Uniform over legal actions
     legal_count = legal.sum()
     if legal_count <= 0:
-        # Shouldn't happen \u2014 caller should not invoke regret matching at terminal.
         return np.zeros_like(legal)
     return legal / legal_count
 
 
 # ---------------------------------------------------------------------------
-# Strategy querying
+# Strategy callables
 # ---------------------------------------------------------------------------
 
-@torch.no_grad()
-def _strategy_from_net(
-    net: Optional[AdvantageNet],
-    obs: np.ndarray,
-    legal: np.ndarray,
-    device: torch.device,
-) -> np.ndarray:
-    if net is None:
-        # Iteration 0: uniform over legal actions.
-        legal_count = legal.sum()
-        if legal_count <= 0:
+# Signature: (obs, legal_mask, seat) -> probability distribution
+StrategyFn = Callable[[np.ndarray, np.ndarray, int], np.ndarray]
+
+
+def make_uniform_strategy_fn() -> StrategyFn:
+    def _fn(obs: np.ndarray, legal: np.ndarray, seat: int) -> np.ndarray:
+        c = legal.sum()
+        if c <= 0:
             return np.zeros_like(legal)
-        return legal / legal_count
-    obs_t = torch.from_numpy(obs).to(device).unsqueeze(0)
-    legal_t = torch.from_numpy(legal).to(device).unsqueeze(0)
-    adv = net(obs_t, legal_t).squeeze(0).float().cpu().numpy()
-    return regret_matching(adv, legal)
+        return legal / c
+    return _fn
+
+
+def make_net_strategy_fn(
+    nets: List[Optional[AdvantageNet]],
+    device: torch.device,
+) -> StrategyFn:
+    """Build a strategy_fn that queries one of the per-seat advantage nets.
+
+    Nets are expected to be in eval mode and on ``device``. Returns the
+    uniform distribution if a seat's net is ``None`` (iter 0).
+    """
+    @torch.no_grad()
+    def _fn(obs: np.ndarray, legal: np.ndarray, seat: int) -> np.ndarray:
+        net = nets[seat]
+        if net is None:
+            c = legal.sum()
+            if c <= 0:
+                return np.zeros_like(legal)
+            return legal / c
+        obs_t = torch.from_numpy(obs).to(device).unsqueeze(0)
+        legal_t = torch.from_numpy(legal).to(device).unsqueeze(0)
+        adv = net(obs_t, legal_t).squeeze(0).float().cpu().numpy()
+        return regret_matching(adv, legal)
+    return _fn
+
+
+# Sample tuple: (obs, legal_mask, target_vec, weight)
+Sample = Tuple[np.ndarray, np.ndarray, np.ndarray, float]
 
 
 # ---------------------------------------------------------------------------
-# Traversal
+# Recursive traversal (sample-collecting)
 # ---------------------------------------------------------------------------
 
 def _traverse(
     state: GameState,
     traverser: int,
-    advantage_nets: List[Optional[AdvantageNet]],
-    advantage_buffer: ReservoirBuffer,
-    strategy_buffer: ReservoirBuffer,
+    strategy_fn: StrategyFn,
+    adv_samples: List[Sample],
+    strat_samples: List[Sample],
     iter_t: int,
-    rng: random.Random,
-    device: torch.device,
+    rng: np.random.Generator,
     linear_weight: bool,
-    big_blind: int = 1,
+    big_blind: int,
 ) -> float:
     """Recursive traversal returning the counterfactual value at ``state``
-    for the traverser (in chips)."""
+    for the traverser (in chips). Pushes regret/strategy samples into the
+    passed-in lists rather than directly into a buffer."""
     if is_terminal(state):
         return float(payoffs(state)[traverser])
 
@@ -112,10 +123,10 @@ def _traverse(
     legal = np.asarray(legal_list, dtype=np.float32)
     obs = encode_observation(state, perspective_seat=seat)
 
-    sigma = _strategy_from_net(advantage_nets[seat], obs, legal, device)
+    sigma = strategy_fn(obs, legal, seat)
+    weight = float(iter_t) if linear_weight else 1.0
 
     if seat == traverser:
-        # Recurse on every legal action.
         action_values = np.zeros_like(legal, dtype=np.float32)
         for a in range(len(legal_list)):
             if not legal_list[a]:
@@ -123,53 +134,109 @@ def _traverse(
             action_values[a] = _traverse(
                 apply_action(state, a),
                 traverser,
-                advantage_nets,
-                advantage_buffer,
-                strategy_buffer,
+                strategy_fn,
+                adv_samples,
+                strat_samples,
                 iter_t,
                 rng,
-                device,
                 linear_weight,
                 big_blind,
             )
         node_value = float((sigma * action_values).sum())
         # Normalize regrets by big_blind to keep targets ~O(1).
         instantaneous_regret = ((action_values - node_value) / max(1, big_blind)) * legal
-        weight = float(iter_t) if linear_weight else 1.0
-        advantage_buffer.add(obs, legal, instantaneous_regret, weight)
+        adv_samples.append((obs, legal, instantaneous_regret.astype(np.float32), weight))
         return node_value
-    else:
-        # External sampling: sample one opponent action.
-        weight = float(iter_t) if linear_weight else 1.0
-        strategy_buffer.add(obs, legal, sigma.astype(np.float32), weight)
-        legal_actions = [a for a, ok in enumerate(legal_list) if ok]
-        probs = sigma[legal_actions]
-        s = probs.sum()
-        if s <= 0:
-            chosen = rng.choice(legal_actions)
-        else:
-            probs = probs / s
-            u = rng.random()
-            cum = 0.0
-            chosen = legal_actions[-1]
-            for a, p in zip(legal_actions, probs):
-                cum += p
-                if u <= cum:
-                    chosen = a
-                    break
-        return _traverse(
-            apply_action(state, chosen),
-            traverser,
-            advantage_nets,
-            advantage_buffer,
-            strategy_buffer,
-            iter_t,
-            rng,
-            device,
-            linear_weight,
-            big_blind,
-        )
 
+    # External sampling: opponent decision \u2014 sample one action from sigma.
+    strat_samples.append((obs, legal, sigma.astype(np.float32), weight))
+    legal_idx = np.flatnonzero(legal)
+    probs = sigma[legal_idx]
+    s = probs.sum()
+    if s <= 0:
+        chosen = int(rng.choice(legal_idx))
+    else:
+        probs = probs / s
+        chosen = int(rng.choice(legal_idx, p=probs))
+    return _traverse(
+        apply_action(state, chosen),
+        traverser,
+        strategy_fn,
+        adv_samples,
+        strat_samples,
+        iter_t,
+        rng,
+        linear_weight,
+        big_blind,
+    )
+
+
+def traverse_one(
+    *,
+    traverser: int,
+    strategy_fn: StrategyFn,
+    iter_t: int,
+    num_players: int,
+    starting_stack: int,
+    small_blind: int,
+    big_blind: int,
+    button: int,
+    action_space: ActionSpace,
+    deal_rng: random.Random,
+    sample_rng: np.random.Generator,
+    linear_weight: bool = True,
+) -> Tuple[List[Sample], List[Sample]]:
+    """Run a single external-sampling traversal and return collected samples.
+
+    ``deal_rng`` is a stdlib ``random.Random`` used by the engine to deal
+    cards (engine API requires Random). ``sample_rng`` is a numpy
+    ``Generator`` used for in-traversal opponent action sampling.
+    """
+    from engine import new_hand
+    state = new_hand(
+        num_players=num_players,
+        starting_stack=starting_stack,
+        small_blind=small_blind,
+        big_blind=big_blind,
+        button=button,
+        rng=deal_rng,
+        action_space=action_space,
+    )
+    adv: List[Sample] = []
+    strat: List[Sample] = []
+    _traverse(
+        state, traverser, strategy_fn, adv, strat,
+        iter_t, sample_rng, linear_weight, big_blind,
+    )
+    return adv, strat
+
+
+def samples_to_arrays(
+    samples: List[Sample],
+    obs_dim: int,
+    num_actions: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Stack a list of sample tuples into numpy arrays.
+
+    Returns empty (0-row) arrays of the correct shape if ``samples`` is empty.
+    """
+    if not samples:
+        return (
+            np.zeros((0, obs_dim), dtype=np.float32),
+            np.zeros((0, num_actions), dtype=np.float32),
+            np.zeros((0, num_actions), dtype=np.float32),
+            np.zeros(0, dtype=np.float32),
+        )
+    obs = np.stack([s[0] for s in samples]).astype(np.float32, copy=False)
+    legal = np.stack([s[1] for s in samples]).astype(np.float32, copy=False)
+    target = np.stack([s[2] for s in samples]).astype(np.float32, copy=False)
+    weight = np.array([s[3] for s in samples], dtype=np.float32)
+    return obs, legal, target, weight
+
+
+# ---------------------------------------------------------------------------
+# Serial wrapper (back-compat with prior call sites and tests)
+# ---------------------------------------------------------------------------
 
 def external_sampling(
     traverser: int,
@@ -184,37 +251,53 @@ def external_sampling(
     small_blind: int,
     big_blind: int,
     action_space: ActionSpace,
-    rng: random.Random,
+    rng,
     device: torch.device,
     linear_weight: bool = True,
 ) -> None:
-    """Run ``num_traversals`` external-sampling MCCFR traversals."""
-    from engine import new_hand
+    """Serial external-sampling MCCFR. Used by tests and the no-pool path.
 
+    ``rng`` may be a ``random.Random`` (legacy) or a ``np.random.Generator``;
+    it is used to seed both card dealing and opponent action sampling.
+    """
+    if isinstance(rng, np.random.Generator):
+        deal_rng = random.Random(int(rng.integers(0, 2**63 - 1)))
+        sample_rng = rng
+    else:
+        deal_rng = rng if isinstance(rng, random.Random) else random.Random()
+        sample_rng = np.random.default_rng(deal_rng.randint(0, 2**63 - 1))
+
+    for net in advantage_nets:
+        if net is not None:
+            net.eval()
+    strategy_fn = make_net_strategy_fn(advantage_nets, device)
+
+    adv_all: List[Sample] = []
+    strat_all: List[Sample] = []
     for k in range(num_traversals):
         button = k % num_players
-        state = new_hand(
+        adv, strat = traverse_one(
+            traverser=traverser,
+            strategy_fn=strategy_fn,
+            iter_t=iter_t,
             num_players=num_players,
             starting_stack=starting_stack,
             small_blind=small_blind,
             big_blind=big_blind,
             button=button,
-            rng=rng,
             action_space=action_space,
+            deal_rng=deal_rng,
+            sample_rng=sample_rng,
+            linear_weight=linear_weight,
         )
-        # Put each net into eval mode for inference safety.
-        for net in advantage_nets:
-            if net is not None:
-                net.eval()
-        _traverse(
-            state,
-            traverser,
-            advantage_nets,
-            advantage_buffer,
-            strategy_buffer,
-            iter_t,
-            rng,
-            device,
-            linear_weight,
-            big_blind,
-        )
+        adv_all.extend(adv)
+        strat_all.extend(strat)
+
+    obs_dim = advantage_buffer.obs_dim
+    num_actions = advantage_buffer.num_actions
+    a_obs, a_legal, a_target, a_weight = samples_to_arrays(adv_all, obs_dim, num_actions)
+    s_obs, s_legal, s_target, s_weight = samples_to_arrays(strat_all, obs_dim, num_actions)
+    if a_obs.shape[0] > 0:
+        advantage_buffer.add_arrays(a_obs, a_legal, a_target, a_weight)
+    if s_obs.shape[0] > 0:
+        strategy_buffer.add_arrays(s_obs, s_legal, s_target, s_weight)

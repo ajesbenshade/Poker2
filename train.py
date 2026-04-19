@@ -148,6 +148,14 @@ def parse_args():
     parser.add_argument("--cfr-strat-steps", dest="cfr_strat_steps", type=int, default=None)
     parser.add_argument("--cfr-batch-size", dest="cfr_batch_size", type=int, default=None)
     parser.add_argument("--cfr-lr", dest="cfr_lr", type=float, default=None)
+    parser.add_argument("--cfr-num-workers", dest="cfr_num_workers", type=int, default=None,
+                        help="Worker processes for parallel CFR traversals (0=serial)")
+    parser.add_argument("--cfr-worker-chunk", dest="cfr_worker_chunk", type=int, default=None,
+                        help="Min traversals per worker chunk")
+    parser.add_argument("--cfr-compile", dest="cfr_compile", action="store_true",
+                        help="Apply torch.compile to GPU train nets")
+    parser.add_argument("--cfr-async", dest="cfr_async", action="store_true",
+                        help="Overlap CPU traversals with GPU training (Phase B)")
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
 
@@ -617,6 +625,14 @@ def train_deep_cfr(args):
         cfg.train_batch_size = int(args.cfr_batch_size)
     if args.cfr_lr is not None:
         cfg.learning_rate = float(args.cfr_lr)
+    if args.cfr_num_workers is not None:
+        cfg.num_workers = int(args.cfr_num_workers)
+    if args.cfr_worker_chunk is not None:
+        cfg.worker_chunk_min = int(args.cfr_worker_chunk)
+    if args.cfr_compile:
+        cfg.use_torch_compile = True
+    if args.cfr_async:
+        cfg.async_pipeline = True
     if args.players is not None:
         cfg.num_players = int(args.players)
     if args.log_interval is not None:

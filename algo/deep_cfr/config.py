@@ -53,3 +53,13 @@ class DeepCFRConfig:
     checkpoint_dir: str = "checkpoints/deep_cfr"
     log_dir: str = "runs/deep_cfr"
     log_interval: int = 1
+
+    # Parallel traversal (Phase A)
+    num_workers: int = 0               # 0 => serial (legacy path); >0 => process pool
+    worker_chunk_min: int = 8          # min traversals per dispatched chunk
+    use_torch_compile: bool = False    # apply torch.compile to GPU train nets
+
+    # Async pipeline (Phase B): overlap CPU traversals with GPU training.
+    # Iter t's traversals are dispatched while iter t-1's GPU training runs.
+    # Requires num_workers > 0. Adds 1-iter staleness to traversal nets.
+    async_pipeline: bool = False

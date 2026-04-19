@@ -34,6 +34,13 @@ from .config import DeepCFRConfig
 from .eval import evaluate_vs_baselines
 from .network import AdvantageNet, PolicyNet
 from .traversal import external_sampling
+from . import worker as _worker_mod
+from .worker import (
+    _init_worker as _worker_init,
+    update_nets as _worker_update_nets,
+    run_chunk as _worker_run_chunk,
+    serialize_state_dict as _worker_serialize,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +111,10 @@ class DeepCFRTrainer:
         self.writer = SummaryWriter(cfg.log_dir)
         self.iter = 0
         self._best_score = -float("inf")
+
+        # Worker pool for parallel traversals (None until first use).
+        self._pool = None
+        self._pool_workers = 0
 
     # -------------------------------------------------------------------
     # Network training helpers
@@ -182,6 +193,145 @@ class DeepCFRTrainer:
         return {"loss": total_loss / max(1, last_steps), "steps": last_steps}
 
     # -------------------------------------------------------------------
+    # Worker pool
+    # -------------------------------------------------------------------
+
+    def _snapshot_state_dicts(self):
+        return [_worker_serialize(net) for net in self.advantage_nets]
+
+    def _ensure_pool(self):
+        if self.cfg.num_workers <= 0:
+            return None
+        if self._pool is not None:
+            return self._pool
+        import multiprocessing as mp
+        from functools import partial
+        ctx = mp.get_context("forkserver")
+        blobs = self._snapshot_state_dicts()
+        # Pool initializer doesn't accept kwargs; bind via functools.partial.
+        init_fn = partial(
+            _worker_init,
+            obs_dim=OBS_DIM,
+            num_actions=self.num_actions,
+            hidden=self.cfg.hidden_size,
+            blocks=self.cfg.num_blocks,
+            action_space=self.action_space,
+            num_players=self.cfg.num_players,
+            starting_stack=self.cfg.starting_stack,
+            small_blind=self.cfg.small_blind,
+            big_blind=self.cfg.big_blind,
+        )
+        self._pool = ctx.Pool(
+            processes=self.cfg.num_workers,
+            initializer=init_fn,
+            initargs=(blobs,),
+        )
+        self._pool_workers = self.cfg.num_workers
+        logger.info("started worker pool: %d processes", self._pool_workers)
+        return self._pool
+
+    def _refresh_workers(self):
+        if self._pool is None:
+            return
+        blobs = self._snapshot_state_dicts()
+        # Broadcast new state_dicts to every worker. Pool.map fans out one
+        # task per process when chunksize=1 and the iterable has W items.
+        self._pool.map(_worker_update_nets, [blobs] * self._pool_workers, chunksize=1)
+
+    def _close_pool(self):
+        if self._pool is not None:
+            self._pool.close()
+            self._pool.join()
+            self._pool = None
+
+    def _parallel_external_sampling(self, traverser: int, t: int) -> None:
+        cfg = self.cfg
+        pool = self._ensure_pool()
+        if pool is None:
+            external_sampling(
+                traverser=traverser,
+                advantage_nets=self.advantage_nets,
+                advantage_buffer=self.advantage_buffers[traverser],
+                strategy_buffer=self.strategy_buffer,
+                iter_t=t,
+                num_traversals=cfg.traversals_per_iter,
+                num_players=cfg.num_players,
+                starting_stack=cfg.starting_stack,
+                small_blind=cfg.small_blind,
+                big_blind=cfg.big_blind,
+                action_space=self.action_space,
+                rng=self.rng,
+                device=self.device,
+                linear_weight=cfg.linear_cfr,
+            )
+            return
+
+        total = cfg.traversals_per_iter
+        nw = self._pool_workers
+        chunk = max(cfg.worker_chunk_min, (total + nw - 1) // nw)
+        tasks = []
+        offset = 0
+        button_offset = 0
+        while offset < total:
+            sz = min(chunk, total - offset)
+            seed = self.rng.randint(0, 2**31 - 1)
+            tasks.append((traverser, sz, t, seed, button_offset, cfg.linear_cfr))
+            offset += sz
+            button_offset += sz
+        results = pool.starmap(_worker_run_chunk, tasks)
+        # Bulk-insert results into reservoirs.
+        adv_buf = self.advantage_buffers[traverser]
+        strat_buf = self.strategy_buffer
+        for (a_obs, a_legal, a_target, a_weight,
+             s_obs, s_legal, s_target, s_weight) in results:
+            if a_obs.shape[0] > 0:
+                adv_buf.add_arrays(a_obs, a_legal, a_target, a_weight)
+            if s_obs.shape[0] > 0:
+                strat_buf.add_arrays(s_obs, s_legal, s_target, s_weight)
+
+    def _dispatch_async_traversals(self, t: int):
+        """Async dispatch: returns list of (traverser, AsyncResult) pairs.
+
+        Workers use whatever CPU snapshots they currently hold (refreshed
+        by the prior iter's :meth:`_refresh_workers` call).
+        """
+        cfg = self.cfg
+        pool = self._ensure_pool()
+        if pool is None:
+            return None
+        nw = self._pool_workers
+        total = cfg.traversals_per_iter
+        chunk = max(cfg.worker_chunk_min, (total + nw - 1) // nw)
+        pending = []
+        for p in range(cfg.num_players):
+            tasks = []
+            offset = 0
+            button_offset = 0
+            while offset < total:
+                sz = min(chunk, total - offset)
+                seed = self.rng.randint(0, 2**31 - 1)
+                tasks.append((p, sz, t, seed, button_offset, cfg.linear_cfr))
+                offset += sz
+                button_offset += sz
+            pending.append((p, pool.starmap_async(_worker_run_chunk, tasks)))
+        return pending
+
+    def _collect_async_traversals(self, pending) -> None:
+        """Block on async results and insert samples into buffers."""
+        if pending is None:
+            return
+        strat_buf = self.strategy_buffer
+        for p, ar in pending:
+            results = ar.get()
+            adv_buf = self.advantage_buffers[p]
+            for (a_obs, a_legal, a_target, a_weight,
+                 s_obs, s_legal, s_target, s_weight) in results:
+                if a_obs.shape[0] > 0:
+                    adv_buf.add_arrays(a_obs, a_legal, a_target, a_weight)
+                if s_obs.shape[0] > 0:
+                    strat_buf.add_arrays(s_obs, s_legal, s_target, s_weight)
+
+    # -------------------------------------------------------------------
     # Main loop
     # -------------------------------------------------------------------
 
@@ -198,26 +348,22 @@ class DeepCFRTrainer:
             self.iter = t
             iter_start = time.time()
 
-            # 1) Run external sampling for each traverser
-            for p in range(cfg.num_players):
-                external_sampling(
-                    traverser=p,
-                    advantage_nets=self.advantage_nets,
-                    advantage_buffer=self.advantage_buffers[p],
-                    strategy_buffer=self.strategy_buffer,
-                    iter_t=t,
-                    num_traversals=cfg.traversals_per_iter,
-                    num_players=cfg.num_players,
-                    starting_stack=cfg.starting_stack,
-                    small_blind=cfg.small_blind,
-                    big_blind=cfg.big_blind,
-                    action_space=self.action_space,
-                    rng=self.rng,
-                    device=self.device,
-                    linear_weight=cfg.linear_cfr,
-                )
+            use_async = (
+                cfg.async_pipeline
+                and cfg.num_workers > 0
+                and t > 1   # iter 1 must be sync to populate buffers first
+            )
 
-            # 2) Train per-player advantage nets
+            # 1) Run external sampling for each traverser
+            if use_async:
+                # Dispatch iter t traversals async; they overlap with GPU train.
+                pending = self._dispatch_async_traversals(t)
+            else:
+                pending = None
+                for p in range(cfg.num_players):
+                    self._parallel_external_sampling(p, t)
+
+            # 2) Train per-player advantage nets (concurrent with async traversals)
             adv_losses = []
             for p in range(cfg.num_players):
                 if cfg.reset_advantage_net_each_iter or self.advantage_nets[p] is None:
@@ -232,6 +378,14 @@ class DeepCFRTrainer:
                 self.writer.add_scalar(f"loss/advantage_p{p}", stats["loss"], t)
                 self.writer.add_scalar(f"buffer/advantage_p{p}",
                                        len(self.advantage_buffers[p]), t)
+
+            # 1b) Wait for async traversals (if any) and insert into buffers.
+            if pending is not None:
+                self._collect_async_traversals(pending)
+
+            # 2b) Push refreshed CPU snapshots to workers for next iter.
+            if self._pool is not None:
+                self._refresh_workers()
 
             # 3) Periodically train the average-policy net
             policy_loss = float("nan")
@@ -292,6 +446,7 @@ class DeepCFRTrainer:
                 )
 
         self.writer.close()
+        self._close_pool()
 
     # -------------------------------------------------------------------
     # Checkpoint
