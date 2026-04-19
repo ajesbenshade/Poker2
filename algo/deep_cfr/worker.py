@@ -173,7 +173,13 @@ def serialize_state_dict(net: Optional[AdvantageNet]) -> Optional[bytes]:
     """Pickle a net's CPU state_dict to bytes for IPC to workers."""
     if net is None:
         return None
-    sd = {k: v.detach().cpu() for k, v in net.state_dict().items()}
+    # torch.compile wraps modules so state_dict keys gain an "_orig_mod."
+    # prefix. Workers rebuild plain (uncompiled) nets, so strip it for IPC.
+    sd = {}
+    for k, v in net.state_dict().items():
+        if k.startswith("_orig_mod."):
+            k = k[len("_orig_mod."):]
+        sd[k] = v.detach().cpu()
     buf = io.BytesIO()
     torch.save(sd, buf)
     return buf.getvalue()

@@ -479,10 +479,18 @@ class DeepCFRTrainer:
     # -------------------------------------------------------------------
 
     def save_checkpoint(self, path: str, meta: Optional[Dict] = None) -> None:
+        def _strip(sd):
+            out = {}
+            for k, v in sd.items():
+                if k.startswith("_orig_mod."):
+                    k = k[len("_orig_mod."):]
+                out[k] = v
+            return out
+
         payload = {
-            "policy_net": self.policy_net.state_dict(),
+            "policy_net": _strip(self.policy_net.state_dict()),
             "advantage_nets": [
-                None if net is None else net.state_dict()
+                None if net is None else _strip(net.state_dict())
                 for net in self.advantage_nets
             ],
             "iter": self.iter,
