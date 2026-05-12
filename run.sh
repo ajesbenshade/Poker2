@@ -3,7 +3,7 @@ set -euo pipefail
 
 export HIP_VISIBLE_DEVICES=0
 export HSA_OVERRIDE_GFX_VERSION=11.0.0
-export PYTORCH_HIP_ALLOC_CONF="garbage_collect_threshold:0.6,expandable_segment:True,max_split_size_mb:128"
+export PYTORCH_HIP_ALLOC_CONF="garbage_collection_threshold:0.8,max_split_size_mb:512"
 export OMP_NUM_THREADS=1
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

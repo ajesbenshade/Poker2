@@ -10,7 +10,7 @@ import psutil
 ROCM_ENV_DEFAULTS = {
     'HIP_VISIBLE_DEVICES': '0',
     'HSA_OVERRIDE_GFX_VERSION': '11.0.0',
-    'PYTORCH_ALLOC_CONF': 'expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:512',
+    'PYTORCH_ALLOC_CONF': 'garbage_collection_threshold:0.8,max_split_size_mb:512',
     'PYTORCH_NO_ROCM_EXPANDABLE_SEGMENTS_WARNING': '1',
     'HSA_ENABLE_SDMA': '0',
     'TORCH_CUDNN_ENABLE': '0',
@@ -51,10 +51,9 @@ def _resolve_allocator_conf():
     normalized_value = _normalize_allocator_conf(source_value)
     if not normalized_value:
         normalized_value = ROCM_ENV_DEFAULTS['PYTORCH_ALLOC_CONF']
-    # Set all three vars PyTorch may read. Previously only PYTORCH_ALLOC_CONF was set
-    # and PYTORCH_HIP_ALLOC_CONF was deleted — PyTorch ROCm reads HIP_ALLOC_CONF and
-    # PyTorch >=2.0 reads CUDA_ALLOC_CONF, so expandable_segments/gc_threshold were
-    # silently ignored on every run, causing accumulating VRAM fragmentation.
+    # Set all three vars PyTorch may read. ROCm builds may read HIP_ALLOC_CONF
+    # while PyTorch >=2.0 may read CUDA_ALLOC_CONF. Keep the same normalized
+    # allocator policy everywhere before torch initializes.
     os.environ['PYTORCH_HIP_ALLOC_CONF'] = normalized_value
     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = normalized_value
     os.environ['PYTORCH_ALLOC_CONF'] = normalized_value

@@ -10,7 +10,7 @@ os.environ.setdefault("HIP_VISIBLE_DEVICES", "0")
 os.environ.setdefault("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
 os.environ.setdefault(
     "PYTORCH_ALLOC_CONF",
-    "expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:512",
+    "garbage_collection_threshold:0.8,max_split_size_mb:512",
 )
 os.environ.setdefault(
     "PYTORCH_HIP_ALLOC_CONF",
@@ -151,15 +151,75 @@ def parse_args():
     parser.add_argument("--cfr-num-workers", dest="cfr_num_workers", type=int, default=None,
                         help="Worker processes for parallel CFR traversals (0=serial)")
     parser.add_argument("--cfr-worker-chunk", dest="cfr_worker_chunk", type=int, default=None,
-                        help="Min traversals per worker chunk")
+                        help="Target traversals per worker task (0=auto one task per worker)")
     parser.add_argument("--cfr-compile", dest="cfr_compile", action="store_true",
                         help="Apply torch.compile to GPU train nets")
     parser.add_argument("--cfr-async", dest="cfr_async", action="store_true",
                         help="Overlap CPU traversals with GPU training (Phase B)")
+    parser.add_argument("--cfr-async-depth", dest="cfr_async_depth", type=int, default=None,
+                        help="Max Deep CFR traversal batches queued ahead when --cfr-async is enabled")
+    parser.add_argument("--cfr-pin-batches", dest="cfr_pin_batches", action="store_true",
+                        help="Pin sampled Deep CFR training batches before GPU transfer")
+    parser.add_argument("--cfr-loss-log-interval", dest="cfr_loss_log_interval", type=int, default=None,
+                        help="Record Deep CFR training loss every N steps (1=every step)")
+    parser.add_argument("--cfr-concurrent-adv", dest="cfr_concurrent_adv", action="store_true",
+                        help="Train per-player advantage nets concurrently on CUDA streams")
+    parser.add_argument("--cfr-worker-threads", dest="cfr_worker_threads", type=int, default=None,
+                        help="Torch CPU threads per Deep CFR traversal worker")
+    parser.add_argument("--cfr-worker-script", dest="cfr_worker_script", action="store_true",
+                        help="Use torch.jit.script for CPU worker advantage nets")
+    parser.add_argument("--cfr-traversal-backend", dest="cfr_traversal_backend",
+                        choices=("recursive", "vectorized"), default=None,
+                        help="Deep CFR traversal backend")
+    parser.add_argument("--cfr-vectorized-batch-size", dest="cfr_vectorized_batch_size",
+                        type=int, default=None,
+                        help="Hands per vectorized traversal batch")
+    parser.add_argument("--cfr-proxy-nets", dest="cfr_proxy_nets", action="store_true",
+                        help="Use smaller distilled advantage nets for traversal workers")
+    parser.add_argument("--cfr-proxy-hidden", dest="cfr_proxy_hidden", type=int, default=None,
+                        help="Hidden size for traversal proxy advantage nets")
+    parser.add_argument("--cfr-proxy-blocks", dest="cfr_proxy_blocks", type=int, default=None,
+                        help="Residual blocks for traversal proxy advantage nets")
+    parser.add_argument("--cfr-proxy-refresh", dest="cfr_proxy_refresh", type=int, default=None,
+                        help="Refresh proxy nets every N CFR iterations")
+    parser.add_argument("--cfr-proxy-steps", dest="cfr_proxy_steps", type=int, default=None,
+                        help="Distillation steps per proxy refresh")
+    parser.add_argument("--cfr-dcfr-alpha", dest="cfr_dcfr_alpha", type=float, default=None,
+                        help="DCFR exponent for advantage sample weights (default 1.0=linear CFR)")
+    parser.add_argument("--cfr-dcfr-gamma", dest="cfr_dcfr_gamma", type=float, default=None,
+                        help="DCFR exponent for strategy sample weights (default 2.0)")
+    parser.add_argument("--cfr-plus", dest="cfr_plus", action="store_true",
+                        help="CFR+ regret clipping: clamp advantage net regression target to >=0")
+    parser.add_argument("--cfr-adv-early-stop", dest="cfr_adv_early_stop", type=int, default=None,
+                        help="Early-stop advantage training after N val plateaus (0=off)")
+    parser.add_argument("--cfr-adv-early-stop-eval-every", dest="cfr_adv_early_stop_eval_every",
+                        type=int, default=None,
+                        help="Steps between val evaluations for advantage early-stop")
+    parser.add_argument("--cfr-adv-early-stop-min-steps", dest="cfr_adv_early_stop_min_steps",
+                        type=int, default=None,
+                        help="Min advantage training steps before early-stop can fire")
+    parser.add_argument("--cfr-latest-interval", dest="cfr_latest_interval", type=int, default=None,
+                        help="Save latest.pt every N CFR iters (1=every iter)")
+    parser.add_argument("--cfr-checkpoint-dir", dest="cfr_checkpoint_dir", type=str, default=None,
+                        help="Checkpoint directory for Deep CFR runs")
+    parser.add_argument("--cfr-log-dir", dest="cfr_log_dir", type=str, default=None,
+                        help="TensorBoard log directory for Deep CFR runs")
+    parser.add_argument("--cfr-inference-server", dest="cfr_inference_server", action="store_true",
+                        help="Route traversal worker NN calls through a batched inference server")
+    parser.add_argument("--cfr-inference-batch-size", dest="cfr_inference_batch_size", type=int, default=None,
+                        help="Max requests per batched traversal inference server forward")
+    parser.add_argument("--cfr-inference-timeout-ms", dest="cfr_inference_timeout_ms", type=float, default=None,
+                        help="Max wait in milliseconds before flushing an inference-server batch")
+    parser.add_argument("--cfr-inference-queue-size", dest="cfr_inference_queue_size", type=int, default=None,
+                        help="Request/response queue size for traversal inference server")
     parser.add_argument("--cfr-lbr-interval", dest="cfr_lbr_interval", type=int, default=None,
                         help="Compute LBR exploitability every N CFR iters (0=off)")
     parser.add_argument("--cfr-lbr-hands", dest="cfr_lbr_hands", type=int, default=None,
                         help="Hands per LBR evaluation")
+    parser.add_argument("--cfr-adv-buf-size", dest="cfr_adv_buf_size", type=int, default=None,
+                        help="Per-player advantage reservoir buffer capacity")
+    parser.add_argument("--cfr-strat-buf-size", dest="cfr_strat_buf_size", type=int, default=None,
+                        help="Strategy reservoir buffer capacity")
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
 
@@ -637,10 +697,66 @@ def train_deep_cfr(args):
         cfg.use_torch_compile = True
     if args.cfr_async:
         cfg.async_pipeline = True
+    if args.cfr_async_depth is not None:
+        cfg.async_pipeline_depth = max(1, int(args.cfr_async_depth))
+    if args.cfr_pin_batches:
+        cfg.pin_training_batches = True
+    if args.cfr_loss_log_interval is not None:
+        cfg.loss_log_interval = int(args.cfr_loss_log_interval)
+    if args.cfr_concurrent_adv:
+        cfg.concurrent_advantage_training = True
+    if args.cfr_worker_threads is not None:
+        cfg.worker_torch_threads = int(args.cfr_worker_threads)
+    if args.cfr_worker_script:
+        cfg.script_worker_nets = True
+    if args.cfr_traversal_backend is not None:
+        cfg.traversal_backend = str(args.cfr_traversal_backend)
+    if args.cfr_vectorized_batch_size is not None:
+        cfg.vectorized_traversal_batch_size = max(1, int(args.cfr_vectorized_batch_size))
+    if args.cfr_proxy_nets:
+        cfg.use_proxy_nets = True
+    if args.cfr_proxy_hidden is not None:
+        cfg.proxy_hidden_size = max(1, int(args.cfr_proxy_hidden))
+    if args.cfr_proxy_blocks is not None:
+        cfg.proxy_num_blocks = max(0, int(args.cfr_proxy_blocks))
+    if args.cfr_proxy_refresh is not None:
+        cfg.proxy_refresh_interval = max(1, int(args.cfr_proxy_refresh))
+    if args.cfr_proxy_steps is not None:
+        cfg.proxy_training_steps = max(1, int(args.cfr_proxy_steps))
+    if args.cfr_dcfr_alpha is not None:
+        cfg.discounted_cfr_alpha = float(args.cfr_dcfr_alpha)
+    if args.cfr_dcfr_gamma is not None:
+        cfg.discounted_cfr_gamma = float(args.cfr_dcfr_gamma)
+    if args.cfr_plus:
+        cfg.cfr_plus = True
+    if args.cfr_adv_early_stop is not None:
+        cfg.adv_early_stop_patience = max(0, int(args.cfr_adv_early_stop))
+    if args.cfr_adv_early_stop_eval_every is not None:
+        cfg.adv_early_stop_eval_every = max(1, int(args.cfr_adv_early_stop_eval_every))
+    if args.cfr_adv_early_stop_min_steps is not None:
+        cfg.adv_early_stop_min_steps = max(0, int(args.cfr_adv_early_stop_min_steps))
+    if args.cfr_latest_interval is not None:
+        cfg.latest_checkpoint_interval = int(args.cfr_latest_interval)
+    if args.cfr_checkpoint_dir is not None:
+        cfg.checkpoint_dir = str(args.cfr_checkpoint_dir)
+    if args.cfr_log_dir is not None:
+        cfg.log_dir = str(args.cfr_log_dir)
+    if args.cfr_inference_server:
+        cfg.traversal_inference_mode = "server"
+    if args.cfr_inference_batch_size is not None:
+        cfg.inference_server_batch_size = int(args.cfr_inference_batch_size)
+    if args.cfr_inference_timeout_ms is not None:
+        cfg.inference_server_timeout_ms = float(args.cfr_inference_timeout_ms)
+    if args.cfr_inference_queue_size is not None:
+        cfg.inference_server_queue_size = int(args.cfr_inference_queue_size)
     if args.cfr_lbr_interval is not None:
         cfg.lbr_interval = int(args.cfr_lbr_interval)
     if args.cfr_lbr_hands is not None:
         cfg.lbr_hands = int(args.cfr_lbr_hands)
+    if args.cfr_adv_buf_size is not None:
+        cfg.advantage_buffer_size = int(args.cfr_adv_buf_size)
+    if args.cfr_strat_buf_size is not None:
+        cfg.strategy_buffer_size = int(args.cfr_strat_buf_size)
     if args.players is not None:
         cfg.num_players = int(args.players)
     if args.log_interval is not None:
@@ -654,12 +770,13 @@ def train_deep_cfr(args):
 
     logger.info(
         "DEEP CFR | players=%d | iters=%d | traversals/iter/p=%d | hidden=%d | blocks=%d | "
-        "stack=%d (%d BB) | adv_steps=%d | strat_steps=%d | bs=%d | lr=%.4g | eval_every=%d (%d hands) | seed=%d",
+        "stack=%d (%d BB) | adv_steps=%d | strat_steps=%d | bs=%d | lr=%.4g | eval_every=%d (%d hands) | backend=%s | proxy=%s | seed=%d",
         cfg.num_players, cfg.num_iterations, cfg.traversals_per_iter,
         cfg.hidden_size, cfg.num_blocks, cfg.starting_stack,
         cfg.starting_stack // cfg.big_blind, cfg.advantage_train_steps,
         cfg.strategy_train_steps, cfg.train_batch_size, cfg.learning_rate,
-        cfg.eval_interval, cfg.eval_hands, cfg.seed,
+        cfg.eval_interval, cfg.eval_hands, cfg.traversal_backend,
+        int(cfg.use_proxy_nets), cfg.seed,
     )
     DeepCFRTrainer(cfg).train()
 

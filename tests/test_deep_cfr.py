@@ -16,7 +16,21 @@ from algo.deep_cfr import (
     external_sampling,
     regret_matching,
 )
+from algo.deep_cfr.inference_server import BatchedAdvantageInference
+from algo.deep_cfr.traversal import (
+    _traverse,
+    make_batched_net_strategy_fn,
+    make_batched_strategy_fn_from_single,
+    make_batched_uniform_strategy_fn,
+    make_net_strategy_fn,
+    make_uniform_strategy_fn,
+    samples_to_arrays,
+)
+from algo.deep_cfr.vectorized_traversal import _traverse_batch, traverse_many_vectorized
+from algo.deep_cfr.worker import _finalize_worker_net, _strip_compile_prefix, serialize_state_dict
+from algo.deep_cfr.trainer import _traversal_chunk_size
 from engine import OBS_DIM, NUM_ACTIONS
+from engine import new_hand
 from engine.actions import ActionSpace
 
 
@@ -88,6 +102,41 @@ def test_advantage_net_shape():
     assert out.shape == (4, NUM_ACTIONS)
 
 
+def test_scripted_worker_net_matches_eager():
+    import algo.deep_cfr.worker as worker_mod
+
+    net = AdvantageNet(obs_dim=OBS_DIM, num_actions=NUM_ACTIONS, hidden=32, num_blocks=1)
+    net.eval()
+    obs = torch.randn(5, OBS_DIM)
+    legal = torch.ones(5, NUM_ACTIONS)
+
+    old_value = worker_mod._SCRIPT_WORKER_NETS
+    worker_mod._SCRIPT_WORKER_NETS = True
+    try:
+        scripted = _finalize_worker_net(net)
+    finally:
+        worker_mod._SCRIPT_WORKER_NETS = old_value
+
+    with torch.no_grad():
+        np.testing.assert_allclose(
+            net(obs, legal).numpy(),
+            scripted(obs, legal).numpy(),
+            atol=1e-5,
+            rtol=1e-5,
+        )
+
+
+def test_worker_strips_compile_prefix_from_state_dict():
+    net = AdvantageNet(obs_dim=OBS_DIM, num_actions=NUM_ACTIONS, hidden=32, num_blocks=1)
+    prefixed = {f"_orig_mod.{k}": v for k, v in net.state_dict().items()}
+    stripped = _strip_compile_prefix(prefixed)
+
+    reloaded = AdvantageNet(obs_dim=OBS_DIM, num_actions=NUM_ACTIONS, hidden=32, num_blocks=1)
+    reloaded.load_state_dict(stripped)
+
+    assert set(stripped) == set(net.state_dict())
+
+
 def test_policy_net_strategy_masks_illegal():
     net = PolicyNet(obs_dim=OBS_DIM, num_actions=NUM_ACTIONS, hidden=32, num_blocks=1)
     obs = torch.randn(2, OBS_DIM)
@@ -101,6 +150,71 @@ def test_policy_net_strategy_masks_illegal():
     assert torch.all(probs[illegal_mask] == 0.0)
     # Probabilities of legal actions sum to 1
     np.testing.assert_allclose(probs.sum(dim=-1).detach().numpy(), 1.0, atol=1e-5)
+
+
+def test_traversal_chunk_size_balances_worker_tasks():
+    assert _traversal_chunk_size(total=2000, num_workers=12, configured_chunk=25) == 25
+    assert _traversal_chunk_size(total=2000, num_workers=12, configured_chunk=0) == 167
+    assert _traversal_chunk_size(total=10, num_workers=12, configured_chunk=25) == 10
+
+
+def test_batched_advantage_inference_matches_single_strategy_fn():
+    net = AdvantageNet(obs_dim=OBS_DIM, num_actions=NUM_ACTIONS, hidden=32, num_blocks=1)
+    net.eval()
+    rng = np.random.default_rng(123)
+    obs = rng.standard_normal((6, OBS_DIM)).astype(np.float32)
+    legal = rng.integers(0, 2, size=(6, NUM_ACTIONS)).astype(np.float32)
+    legal[:, 0] = 1.0
+    seats = np.zeros(6, dtype=np.int64)
+
+    engine = BatchedAdvantageInference(
+        obs_dim=OBS_DIM,
+        num_actions=NUM_ACTIONS,
+        hidden=32,
+        blocks=1,
+        dropout=0.0,
+        device=torch.device("cpu"),
+        amp_dtype=None,
+        num_players=2,
+    )
+    engine.load_state_dict_blobs([serialize_state_dict(net), None])
+    batched = engine.infer_batch(seats, obs, legal)
+
+    single_fn = make_net_strategy_fn([net, None], torch.device("cpu"))
+    expected = np.stack([single_fn(obs[i], legal[i], 0) for i in range(obs.shape[0])])
+    np.testing.assert_allclose(batched, expected, atol=1e-6)
+
+
+def test_batched_strategy_adapter_matches_single_rows():
+    rng = np.random.default_rng(17)
+    obs = rng.standard_normal((7, OBS_DIM)).astype(np.float32)
+    legal = rng.integers(0, 2, size=(7, NUM_ACTIONS)).astype(np.float32)
+    legal[:, 1] = 1.0
+
+    single = make_uniform_strategy_fn()
+    batched = make_batched_strategy_fn_from_single(single)
+    expected = np.stack([single(obs[i], legal[i], 0) for i in range(obs.shape[0])])
+    np.testing.assert_allclose(batched(obs, legal, 0), expected, atol=1e-6)
+
+
+def test_batched_net_strategy_matches_single_and_scripted():
+    net = AdvantageNet(obs_dim=OBS_DIM, num_actions=NUM_ACTIONS, hidden=32, num_blocks=1)
+    net.eval()
+    scripted = torch.jit.script(net)
+    scripted.eval()
+
+    rng = np.random.default_rng(23)
+    obs = rng.standard_normal((5, OBS_DIM)).astype(np.float32)
+    legal = rng.integers(0, 2, size=(5, NUM_ACTIONS)).astype(np.float32)
+    legal[:, 0] = 1.0
+
+    single = make_net_strategy_fn([net, None], torch.device("cpu"))
+    batched = make_batched_net_strategy_fn([net, None], torch.device("cpu"))
+    scripted_batched = make_batched_net_strategy_fn([scripted, None], torch.device("cpu"))
+
+    expected = np.stack([single(obs[i], legal[i], 0) for i in range(obs.shape[0])])
+    np.testing.assert_allclose(batched(obs, legal, 0), expected, atol=1e-6)
+    np.testing.assert_allclose(scripted_batched(obs, legal, 0), expected, atol=1e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +271,213 @@ def test_trainer_runs_one_iteration(tmp_path):
     trainer.train()
     assert trainer.iter == 1
     # latest.pt should exist
+    import os
+    assert os.path.exists(os.path.join(cfg.checkpoint_dir, "latest.pt"))
+
+
+def test_trainer_runs_with_optimization_flags_on_cpu(tmp_path):
+    cfg = DeepCFRConfig(
+        num_iterations=1,
+        traversals_per_iter=8,
+        hidden_size=32,
+        num_blocks=1,
+        advantage_buffer_size=512,
+        strategy_buffer_size=512,
+        advantage_train_steps=2,
+        strategy_train_steps=2,
+        train_batch_size=16,
+        eval_interval=0,
+        starting_stack=20,
+        device="cpu",
+        amp_dtype="float32",
+        pin_training_batches=True,
+        loss_log_interval=2,
+        concurrent_advantage_training=True,
+        latest_checkpoint_interval=5,
+        log_dir=str(tmp_path / "runs"),
+        checkpoint_dir=str(tmp_path / "ckpt"),
+    )
+    trainer = DeepCFRTrainer(cfg)
+    trainer.train()
+    assert trainer.iter == 1
+    import os
+    assert os.path.exists(os.path.join(cfg.checkpoint_dir, "latest.pt"))
+
+
+def test_trainer_runs_with_vectorized_backend_on_cpu(tmp_path):
+    cfg = DeepCFRConfig(
+        num_iterations=1,
+        traversals_per_iter=8,
+        hidden_size=32,
+        num_blocks=1,
+        advantage_buffer_size=512,
+        strategy_buffer_size=512,
+        advantage_train_steps=2,
+        strategy_train_steps=2,
+        train_batch_size=16,
+        eval_interval=0,
+        starting_stack=20,
+        device="cpu",
+        amp_dtype="float32",
+        traversal_backend="vectorized",
+        vectorized_traversal_batch_size=4,
+        log_dir=str(tmp_path / "runs"),
+        checkpoint_dir=str(tmp_path / "ckpt"),
+    )
+    trainer = DeepCFRTrainer(cfg)
+    trainer.train()
+    assert trainer.iter == 1
+    import os
+    assert os.path.exists(os.path.join(cfg.checkpoint_dir, "latest.pt"))
+
+
+def test_trainer_runs_with_vectorized_workers_on_cpu(tmp_path):
+    cfg = DeepCFRConfig(
+        num_iterations=1,
+        traversals_per_iter=4,
+        hidden_size=32,
+        num_blocks=1,
+        advantage_buffer_size=256,
+        strategy_buffer_size=256,
+        advantage_train_steps=1,
+        strategy_train_steps=1,
+        train_batch_size=8,
+        eval_interval=0,
+        starting_stack=20,
+        device="cpu",
+        amp_dtype="float32",
+        num_workers=2,
+        worker_chunk_min=2,
+        traversal_backend="vectorized",
+        vectorized_traversal_batch_size=2,
+        log_dir=str(tmp_path / "runs"),
+        checkpoint_dir=str(tmp_path / "ckpt"),
+    )
+    trainer = DeepCFRTrainer(cfg)
+    trainer.train()
+    assert trainer.iter == 1
+    import os
+    assert os.path.exists(os.path.join(cfg.checkpoint_dir, "latest.pt"))
+
+
+def test_trainer_runs_with_vectorized_proxy_workers_on_cpu(tmp_path):
+    cfg = DeepCFRConfig(
+        num_iterations=2,
+        traversals_per_iter=4,
+        hidden_size=32,
+        num_blocks=1,
+        advantage_buffer_size=256,
+        strategy_buffer_size=256,
+        advantage_train_steps=1,
+        strategy_train_steps=1,
+        train_batch_size=8,
+        eval_interval=0,
+        starting_stack=20,
+        device="cpu",
+        amp_dtype="float32",
+        num_workers=2,
+        worker_chunk_min=2,
+        traversal_backend="vectorized",
+        vectorized_traversal_batch_size=2,
+        use_proxy_nets=True,
+        proxy_hidden_size=16,
+        proxy_num_blocks=1,
+        proxy_refresh_interval=1,
+        proxy_training_steps=1,
+        log_dir=str(tmp_path / "runs"),
+        checkpoint_dir=str(tmp_path / "ckpt"),
+    )
+    trainer = DeepCFRTrainer(cfg)
+    trainer.train()
+    assert trainer.iter == 2
+    assert all(net is not None for net in trainer.proxy_advantage_nets)
+    assert trainer.proxy_advantage_nets[0].trunk.input.out_features == 16
+    payload = torch.load(tmp_path / "ckpt" / "latest.pt", map_location="cpu")
+    assert payload["config"]["use_proxy_nets"] is True
+    assert all(sd is not None for sd in payload["proxy_advantage_nets"])
+
+
+def test_latest_checkpoint_interval_saves_final_iteration(tmp_path):
+    cfg = DeepCFRConfig(
+        num_iterations=3,
+        traversals_per_iter=4,
+        hidden_size=32,
+        num_blocks=1,
+        advantage_buffer_size=256,
+        strategy_buffer_size=256,
+        advantage_train_steps=1,
+        strategy_train_steps=1,
+        train_batch_size=8,
+        eval_interval=0,
+        starting_stack=20,
+        device="cpu",
+        amp_dtype="float32",
+        latest_checkpoint_interval=2,
+        log_dir=str(tmp_path / "runs"),
+        checkpoint_dir=str(tmp_path / "ckpt"),
+    )
+    trainer = DeepCFRTrainer(cfg)
+    trainer.train()
+    payload = torch.load(tmp_path / "ckpt" / "latest.pt", map_location="cpu")
+    assert payload["iter"] == 3
+
+
+def test_trainer_runs_with_inference_server_on_cpu(tmp_path):
+    cfg = DeepCFRConfig(
+        num_iterations=2,
+        traversals_per_iter=4,
+        hidden_size=32,
+        num_blocks=1,
+        advantage_buffer_size=256,
+        strategy_buffer_size=256,
+        advantage_train_steps=1,
+        strategy_train_steps=1,
+        train_batch_size=8,
+        eval_interval=0,
+        starting_stack=20,
+        device="cpu",
+        amp_dtype="float32",
+        num_workers=2,
+        worker_chunk_min=2,
+        traversal_inference_mode="server",
+        inference_server_batch_size=8,
+        inference_server_timeout_ms=1.0,
+        log_dir=str(tmp_path / "runs"),
+        checkpoint_dir=str(tmp_path / "ckpt"),
+    )
+    trainer = DeepCFRTrainer(cfg)
+    trainer.train()
+    assert trainer.iter == 2
+    import os
+    assert os.path.exists(os.path.join(cfg.checkpoint_dir, "latest.pt"))
+
+
+def test_trainer_runs_with_scripted_workers_and_async_depth_on_cpu(tmp_path):
+    cfg = DeepCFRConfig(
+        num_iterations=3,
+        traversals_per_iter=6,
+        hidden_size=32,
+        num_blocks=1,
+        advantage_buffer_size=512,
+        strategy_buffer_size=512,
+        advantage_train_steps=1,
+        strategy_train_steps=1,
+        train_batch_size=8,
+        eval_interval=0,
+        starting_stack=20,
+        device="cpu",
+        amp_dtype="float32",
+        num_workers=2,
+        worker_chunk_min=2,
+        script_worker_nets=True,
+        async_pipeline=True,
+        async_pipeline_depth=2,
+        log_dir=str(tmp_path / "runs"),
+        checkpoint_dir=str(tmp_path / "ckpt"),
+    )
+    trainer = DeepCFRTrainer(cfg)
+    trainer.train()
+    assert trainer.iter == 3
     import os
     assert os.path.exists(os.path.join(cfg.checkpoint_dir, "latest.pt"))
 
@@ -334,6 +655,149 @@ def test_worker_run_chunk_returns_arrays():
     assert a_target.shape[1] == aspace.num_actions
     assert s_obs.shape[1] == OBS_DIM
     # At least one of advantage / strategy samples must be produced.
+    assert (a_obs.shape[0] + s_obs.shape[0]) > 0
+
+
+def test_vectorized_traversal_outputs_valid_samples():
+    aspace = ActionSpace()
+    adv, strat = traverse_many_vectorized(
+        traverser=0,
+        strategy_fn=make_uniform_strategy_fn(),
+        batch_strategy_fn=make_batched_uniform_strategy_fn(),
+        iter_t=3,
+        num_traversals=8,
+        num_players=2,
+        starting_stack=20,
+        small_blind=1,
+        big_blind=2,
+        button_offset=0,
+        action_space=aspace,
+        deal_rng=random.Random(11),
+        sample_seed_rng=np.random.default_rng(12),
+        linear_weight=True,
+    )
+    assert len(adv) + len(strat) > 0
+    for obs_v, legal_v, target_v, weight in adv + strat:
+        assert obs_v.shape == (OBS_DIM,)
+        assert legal_v.shape == (NUM_ACTIONS,)
+        assert target_v.shape == (NUM_ACTIONS,)
+        assert np.all(np.isfinite(obs_v))
+        assert np.all(np.isfinite(target_v))
+        assert weight == 3.0
+    for _, legal_v, sigma_v, _ in strat:
+        assert np.all(sigma_v[legal_v < 0.5] == 0.0)
+        np.testing.assert_allclose(float(sigma_v.sum()), 1.0, atol=1e-6)
+
+
+def test_vectorized_single_state_matches_recursive_oracle():
+    aspace = ActionSpace()
+    state = new_hand(
+        num_players=2,
+        starting_stack=20,
+        small_blind=1,
+        big_blind=2,
+        button=0,
+        rng=random.Random(33),
+        action_space=aspace,
+    )
+    recursive_adv = []
+    recursive_strat = []
+    vectorized_adv = []
+    vectorized_strat = []
+    strategy_fn = make_uniform_strategy_fn()
+    batch_strategy_fn = make_batched_uniform_strategy_fn()
+
+    recursive_value = _traverse(
+        state,
+        0,
+        strategy_fn,
+        recursive_adv,
+        recursive_strat,
+        2,
+        np.random.default_rng(44),
+        True,
+        2,
+    )
+    vectorized_value = _traverse_batch(
+        [state],
+        [np.random.default_rng(44)],
+        traverser=0,
+        batch_strategy_fn=batch_strategy_fn,
+        adv_samples=vectorized_adv,
+        strat_samples=vectorized_strat,
+        iter_t=2,
+        linear_weight=True,
+        big_blind=2,
+    )[0]
+
+    np.testing.assert_allclose(vectorized_value, recursive_value, atol=1e-6)
+    for arrays_a, arrays_b in (
+        (samples_to_arrays(vectorized_adv, OBS_DIM, NUM_ACTIONS), samples_to_arrays(recursive_adv, OBS_DIM, NUM_ACTIONS)),
+        (samples_to_arrays(vectorized_strat, OBS_DIM, NUM_ACTIONS), samples_to_arrays(recursive_strat, OBS_DIM, NUM_ACTIONS)),
+    ):
+        for left, right in zip(arrays_a, arrays_b):
+            np.testing.assert_allclose(left, right, atol=1e-6)
+
+
+def test_vectorized_traversal_is_deterministic_for_fixed_seeds():
+    def run_once():
+        aspace = ActionSpace()
+        return traverse_many_vectorized(
+            traverser=1,
+            strategy_fn=make_uniform_strategy_fn(),
+            batch_strategy_fn=make_batched_uniform_strategy_fn(),
+            iter_t=2,
+            num_traversals=6,
+            num_players=2,
+            starting_stack=20,
+            small_blind=1,
+            big_blind=2,
+            button_offset=0,
+            action_space=aspace,
+            deal_rng=random.Random(101),
+            sample_seed_rng=np.random.default_rng(202),
+            linear_weight=True,
+        )
+
+    adv_a, strat_a = run_once()
+    adv_b, strat_b = run_once()
+    for arrays_a, arrays_b in (
+        (samples_to_arrays(adv_a, OBS_DIM, NUM_ACTIONS), samples_to_arrays(adv_b, OBS_DIM, NUM_ACTIONS)),
+        (samples_to_arrays(strat_a, OBS_DIM, NUM_ACTIONS), samples_to_arrays(strat_b, OBS_DIM, NUM_ACTIONS)),
+    ):
+        for left, right in zip(arrays_a, arrays_b):
+            np.testing.assert_allclose(left, right, atol=1e-6)
+
+
+def test_worker_run_chunk_vectorized_returns_arrays():
+    from algo.deep_cfr import worker as W
+    aspace = ActionSpace()
+    W._init_worker(
+        [None, None],
+        obs_dim=OBS_DIM,
+        num_actions=aspace.num_actions,
+        hidden=64,
+        blocks=1,
+        action_space=aspace,
+        num_players=2,
+        starting_stack=20,
+        small_blind=1,
+        big_blind=2,
+    )
+    out = W.run_chunk_vectorized(
+        traverser=0,
+        chunk_size=8,
+        iter_t=1,
+        base_seed=12345,
+        button_offset=0,
+        linear_weight=True,
+        vectorized_batch_size=4,
+    )
+    a_obs, a_legal, a_target, a_weight, s_obs, s_legal, s_target, s_weight = out
+    assert a_obs.shape[1] == OBS_DIM
+    assert a_legal.shape[1] == aspace.num_actions
+    assert a_target.shape[1] == aspace.num_actions
+    assert s_obs.shape[1] == OBS_DIM
     assert (a_obs.shape[0] + s_obs.shape[0]) > 0
 
 

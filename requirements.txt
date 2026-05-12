@@ -1,6 +1,8 @@
 # Core dependencies for Poker2
-# Note: Install PyTorch per https://pytorch.org for the correct CUDA/CPU wheel if needed.
-# If you want a CPU-only install, consider: pip install "torch==2.2.0+cpu" -f https://download.pytorch.org/whl/torch_stable.html
+# Note: install PyTorch separately for your accelerator before this file when possible.
+# For AMD ROCm on the RX 7900 XT, use the current ROCm wheel command from:
+# https://pytorch.org/get-started/locally/
+# The plain `torch` entry below may install a CPU/CUDA wheel depending on platform and index.
 
 torch
 numpy

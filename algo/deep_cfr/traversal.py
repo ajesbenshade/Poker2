@@ -13,7 +13,7 @@ wrapper that constructs a strategy_fn from the passed advantage nets.
 from __future__ import annotations
 
 import random
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -58,19 +58,87 @@ def regret_matching(advantages: np.ndarray, legal: np.ndarray) -> np.ndarray:
 
 # Signature: (obs, legal_mask, seat) -> probability distribution
 StrategyFn = Callable[[np.ndarray, np.ndarray, int], np.ndarray]
+BatchStrategyFn = Callable[[np.ndarray, np.ndarray, int], np.ndarray]
+
+
+def _uniform_strategy(legal: np.ndarray) -> np.ndarray:
+    legal = legal.astype(np.float32, copy=False)
+    c = legal.sum()
+    if c <= 0:
+        return np.zeros_like(legal, dtype=np.float32)
+    return legal / c
+
+
+def _uniform_strategy_batch(legal: np.ndarray) -> np.ndarray:
+    legal = legal.astype(np.float32, copy=False)
+    if legal.ndim != 2:
+        raise ValueError("batched legal mask must have shape (batch, actions)")
+    counts = legal.sum(axis=1, keepdims=True)
+    out = np.divide(
+        legal,
+        np.maximum(counts, 1.0),
+        out=np.zeros_like(legal, dtype=np.float32),
+        where=counts > 0,
+    )
+    return out.astype(np.float32, copy=False)
 
 
 def make_uniform_strategy_fn() -> StrategyFn:
     def _fn(obs: np.ndarray, legal: np.ndarray, seat: int) -> np.ndarray:
-        c = legal.sum()
-        if c <= 0:
-            return np.zeros_like(legal)
-        return legal / c
+        return _uniform_strategy(legal)
+    return _fn
+
+
+def make_batched_uniform_strategy_fn() -> BatchStrategyFn:
+    def _fn(obs: np.ndarray, legal: np.ndarray, seat: int) -> np.ndarray:
+        return _uniform_strategy_batch(legal)
+    return _fn
+
+
+def make_batched_strategy_fn_from_single(strategy_fn: StrategyFn) -> BatchStrategyFn:
+    def _fn(obs: np.ndarray, legal: np.ndarray, seat: int) -> np.ndarray:
+        if obs.ndim != 2 or legal.ndim != 2:
+            raise ValueError("batched strategy inputs must have shape (batch, dims)")
+        if obs.shape[0] != legal.shape[0]:
+            raise ValueError("obs and legal batch sizes must match")
+        if obs.shape[0] == 0:
+            return np.zeros_like(legal, dtype=np.float32)
+        rows = [strategy_fn(obs[i], legal[i], seat) for i in range(obs.shape[0])]
+        return np.stack(rows).astype(np.float32, copy=False)
+    return _fn
+
+
+def make_batched_net_strategy_fn(
+    nets: Sequence[Optional[torch.nn.Module]],
+    device: torch.device,
+) -> BatchStrategyFn:
+    """Build a batched per-seat strategy function from advantage nets."""
+    @torch.no_grad()
+    def _fn(obs: np.ndarray, legal: np.ndarray, seat: int) -> np.ndarray:
+        if obs.ndim != 2 or legal.ndim != 2:
+            raise ValueError("batched net strategy inputs must have shape (batch, dims)")
+        if obs.shape[0] != legal.shape[0]:
+            raise ValueError("obs and legal batch sizes must match")
+        if obs.shape[0] == 0:
+            return np.zeros_like(legal, dtype=np.float32)
+
+        net = nets[seat]
+        if net is None:
+            return _uniform_strategy_batch(legal)
+
+        obs_t = torch.from_numpy(obs.astype(np.float32, copy=False)).to(device)
+        legal_t = torch.from_numpy(legal.astype(np.float32, copy=False)).to(device)
+        adv = net(obs_t, legal_t).float()
+        pos = torch.clamp(adv, min=0.0) * legal_t
+        total = pos.sum(dim=-1, keepdim=True)
+        uniform = legal_t / legal_t.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        probs = torch.where(total > 0, pos / total.clamp_min(1e-8), uniform)
+        return probs.cpu().numpy().astype(np.float32, copy=False)
     return _fn
 
 
 def make_net_strategy_fn(
-    nets: List[Optional[AdvantageNet]],
+    nets: Sequence[Optional[torch.nn.Module]],
     device: torch.device,
 ) -> StrategyFn:
     """Build a strategy_fn that queries one of the per-seat advantage nets.
@@ -82,10 +150,7 @@ def make_net_strategy_fn(
     def _fn(obs: np.ndarray, legal: np.ndarray, seat: int) -> np.ndarray:
         net = nets[seat]
         if net is None:
-            c = legal.sum()
-            if c <= 0:
-                return np.zeros_like(legal)
-            return legal / c
+            return _uniform_strategy(legal)
         obs_t = torch.from_numpy(obs).to(device).unsqueeze(0)
         legal_t = torch.from_numpy(legal).to(device).unsqueeze(0)
         adv = net(obs_t, legal_t).squeeze(0).float().cpu().numpy()
@@ -111,6 +176,8 @@ def _traverse(
     rng: np.random.Generator,
     linear_weight: bool,
     big_blind: int,
+    adv_weight_power: float = 1.0,
+    strat_weight_power: float = 1.0,
 ) -> float:
     """Recursive traversal returning the counterfactual value at ``state``
     for the traverser (in chips). Pushes regret/strategy samples into the
@@ -124,7 +191,12 @@ def _traverse(
     obs = encode_observation(state, perspective_seat=seat)
 
     sigma = strategy_fn(obs, legal, seat)
-    weight = float(iter_t) if linear_weight else 1.0
+    if linear_weight:
+        adv_w = float(iter_t) ** adv_weight_power
+        strat_w = float(iter_t) ** strat_weight_power
+    else:
+        adv_w = 1.0
+        strat_w = 1.0
 
     if seat == traverser:
         action_values = np.zeros_like(legal, dtype=np.float32)
@@ -141,15 +213,17 @@ def _traverse(
                 rng,
                 linear_weight,
                 big_blind,
+                adv_weight_power,
+                strat_weight_power,
             )
         node_value = float((sigma * action_values).sum())
         # Normalize regrets by big_blind to keep targets ~O(1).
         instantaneous_regret = ((action_values - node_value) / max(1, big_blind)) * legal
-        adv_samples.append((obs, legal, instantaneous_regret.astype(np.float32), weight))
+        adv_samples.append((obs, legal, instantaneous_regret.astype(np.float32), adv_w))
         return node_value
 
     # External sampling: opponent decision \u2014 sample one action from sigma.
-    strat_samples.append((obs, legal, sigma.astype(np.float32), weight))
+    strat_samples.append((obs, legal, sigma.astype(np.float32), strat_w))
     legal_idx = np.flatnonzero(legal)
     probs = sigma[legal_idx]
     s = probs.sum()
@@ -168,6 +242,8 @@ def _traverse(
         rng,
         linear_weight,
         big_blind,
+        adv_weight_power,
+        strat_weight_power,
     )
 
 
@@ -185,6 +261,8 @@ def traverse_one(
     deal_rng: random.Random,
     sample_rng: np.random.Generator,
     linear_weight: bool = True,
+    adv_weight_power: float = 1.0,
+    strat_weight_power: float = 1.0,
 ) -> Tuple[List[Sample], List[Sample]]:
     """Run a single external-sampling traversal and return collected samples.
 
@@ -207,6 +285,7 @@ def traverse_one(
     _traverse(
         state, traverser, strategy_fn, adv, strat,
         iter_t, sample_rng, linear_weight, big_blind,
+        adv_weight_power, strat_weight_power,
     )
     return adv, strat
 
@@ -254,6 +333,8 @@ def external_sampling(
     rng,
     device: torch.device,
     linear_weight: bool = True,
+    adv_weight_power: float = 1.0,
+    strat_weight_power: float = 1.0,
 ) -> None:
     """Serial external-sampling MCCFR. Used by tests and the no-pool path.
 
@@ -289,6 +370,8 @@ def external_sampling(
             deal_rng=deal_rng,
             sample_rng=sample_rng,
             linear_weight=linear_weight,
+            adv_weight_power=adv_weight_power,
+            strat_weight_power=strat_weight_power,
         )
         adv_all.extend(adv)
         strat_all.extend(strat)

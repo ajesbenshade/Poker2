@@ -1,7 +1,7 @@
-# PPO-First ROCm Optimization Guide
+# Poker2 ROCm Optimization Guide
 ## For Ryzen 9 7900X + RX 7900 XT (20GB VRAM) + 64GB RAM
 
-This repository's active high-performance path is PPO in `train.py` and `rl.py`, not the older Deep CFR flow.
+The primary bring-up path is now Deep CFR via `train.py --algo deep-cfr`. PPO remains available as a baseline in `train.py` and `rl.py`.
 
 ## Critical Startup Order
 
@@ -13,7 +13,7 @@ Use `PYTORCH_ALLOC_CONF`, not `PYTORCH_HIP_ALLOC_CONF`. The current default conf
 
 - `HIP_VISIBLE_DEVICES=0`
 - `HSA_OVERRIDE_GFX_VERSION=11.0.0`
-- `PYTORCH_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:512`
+- `PYTORCH_ALLOC_CONF=garbage_collection_threshold:0.8,max_split_size_mb:512`
 - `HSA_ENABLE_SDMA=0`
 - `TORCH_CUDNN_ENABLE=0`
 - `OMP_NUM_THREADS=1`
@@ -21,6 +21,32 @@ Use `PYTORCH_ALLOC_CONF`, not `PYTORCH_HIP_ALLOC_CONF`. The current default conf
 ## Precision and Safety
 
 `torch.set_default_dtype(torch.float32)` remains the safe baseline. PPO AMP is enabled on ROCm, and the default trainer configuration now prefers bf16 when supported, otherwise falls back to fp16. Any tensor exported to NumPy must cast through `.float().numpy()` first.
+
+For Deep CFR, prefer `--amp-dtype bf16` on the RX 7900 XT. Keep `--cfr-compile` off unless you are explicitly testing it; worker state snapshots are normalized for compiled modules, but compile can still add ROCm warm-up overhead.
+
+## Deep CFR Validation Ladder
+
+Run these commands from the repository root with the project virtual environment available. `./run.sh` applies the ROCm startup environment and dispatches to `train.py`.
+
+1. Serial smoke test:
+
+`./run.sh --algo deep-cfr --iterations 2 --cfr-traversals 100 --cfr-hidden 64 --cfr-blocks 2 --cfr-batch-size 512 --cfr-adv-steps 100 --cfr-strat-steps 200 --amp-dtype bf16 --seed 0`
+
+Expected: two iterations complete, no worker `state_dict` errors, and VRAM remains well below 6 GB.
+
+2. Multiprocessing validation:
+
+`./run.sh --algo deep-cfr --iterations 5 --cfr-traversals 256 --cfr-hidden 128 --cfr-blocks 3 --cfr-batch-size 1024 --cfr-adv-steps 1000 --cfr-strat-steps 2000 --cfr-num-workers 8 --cfr-worker-chunk 16 --amp-dtype bf16 --seed 0`
+
+Expected: the worker pool starts, five iterations complete, and VRAM is typically around 10-13 GB.
+
+3. Stable long-run profile:
+
+`./run.sh --algo deep-cfr --iterations 200 --cfr-traversals 1500 --cfr-hidden 256 --cfr-blocks 4 --cfr-batch-size 4096 --cfr-adv-steps 4000 --cfr-strat-steps 8000 --cfr-num-workers 12 --cfr-worker-chunk 25 --cfr-eval-interval 5 --cfr-eval-hands 2000 --amp-dtype bf16 --seed 42`
+
+Expected: steady iteration times, no `_orig_mod.` worker reload failures, and VRAM generally below 18 GB.
+
+If VRAM approaches 18 GB or workers crash, reduce `--cfr-num-workers` to 8-10 or lower `--cfr-batch-size` to 2048. If VRAM stays under 14 GB and CPU utilization is low, try 14 workers or a larger `--cfr-worker-chunk` before increasing model size.
 
 ## Validated PPO Run Shape
 
