@@ -92,6 +92,7 @@ class DeepCFRConfig:
     script_worker_nets: bool = False   # torch.jit.script CPU worker advantage nets
     traversal_backend: str = "recursive"  # "recursive" | "vectorized"
     vectorized_traversal_batch_size: int = 64
+    worker_result_transport: str = "ipc"  # "ipc" | "file" for large chunk payloads
     use_proxy_nets: bool = False       # distill smaller traversal-only advantage nets
     proxy_hidden_size: int = 128
     proxy_num_blocks: int = 2

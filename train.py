@@ -174,6 +174,9 @@ def parse_args():
     parser.add_argument("--cfr-vectorized-batch-size", dest="cfr_vectorized_batch_size",
                         type=int, default=None,
                         help="Hands per vectorized traversal batch")
+    parser.add_argument("--cfr-worker-result-transport", dest="cfr_worker_result_transport",
+                        choices=("ipc", "file"), default=None,
+                        help="How Deep CFR workers return traversal samples")
     parser.add_argument("--cfr-proxy-nets", dest="cfr_proxy_nets", action="store_true",
                         help="Use smaller distilled advantage nets for traversal workers")
     parser.add_argument("--cfr-proxy-hidden", dest="cfr_proxy_hidden", type=int, default=None,
@@ -713,6 +716,8 @@ def train_deep_cfr(args):
         cfg.traversal_backend = str(args.cfr_traversal_backend)
     if args.cfr_vectorized_batch_size is not None:
         cfg.vectorized_traversal_batch_size = max(1, int(args.cfr_vectorized_batch_size))
+    if args.cfr_worker_result_transport is not None:
+        cfg.worker_result_transport = str(args.cfr_worker_result_transport)
     if args.cfr_proxy_nets:
         cfg.use_proxy_nets = True
     if args.cfr_proxy_hidden is not None:

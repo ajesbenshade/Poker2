@@ -14,7 +14,9 @@ module import in each worker — a one-time per-process cost.
 from __future__ import annotations
 
 import io
+import os
 import random
+import tempfile
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -298,6 +300,92 @@ def run_chunk_vectorized(
     return (
         a_obs, a_legal, a_target, a_weight,
         s_obs, s_legal, s_target, s_weight,
+    )
+
+
+def _save_chunk_result(
+    result: Tuple[
+        np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+        np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+    ],
+    result_dir: str,
+) -> str:
+    os.makedirs(result_dir, exist_ok=True)
+    fd, path = tempfile.mkstemp(
+        prefix="deep_cfr_chunk_",
+        suffix=".npz",
+        dir=result_dir,
+    )
+    os.close(fd)
+    (
+        a_obs, a_legal, a_target, a_weight,
+        s_obs, s_legal, s_target, s_weight,
+    ) = result
+    np.savez(
+        path,
+        a_obs=a_obs,
+        a_legal=a_legal,
+        a_target=a_target,
+        a_weight=a_weight,
+        s_obs=s_obs,
+        s_legal=s_legal,
+        s_target=s_target,
+        s_weight=s_weight,
+    )
+    return path
+
+
+def run_chunk_to_file(
+    traverser: int,
+    chunk_size: int,
+    iter_t: int,
+    base_seed: int,
+    button_offset: int,
+    linear_weight: bool,
+    adv_weight_power: float = 1.0,
+    strat_weight_power: float = 1.0,
+    result_dir: str = ".",
+) -> str:
+    return _save_chunk_result(
+        run_chunk(
+            traverser,
+            chunk_size,
+            iter_t,
+            base_seed,
+            button_offset,
+            linear_weight,
+            adv_weight_power,
+            strat_weight_power,
+        ),
+        result_dir,
+    )
+
+
+def run_chunk_vectorized_to_file(
+    traverser: int,
+    chunk_size: int,
+    iter_t: int,
+    base_seed: int,
+    button_offset: int,
+    linear_weight: bool,
+    vectorized_batch_size: int,
+    adv_weight_power: float = 1.0,
+    strat_weight_power: float = 1.0,
+    result_dir: str = ".",
+) -> str:
+    return _save_chunk_result(
+        run_chunk_vectorized(
+            traverser,
+            chunk_size,
+            iter_t,
+            base_seed,
+            button_offset,
+            linear_weight,
+            vectorized_batch_size,
+            adv_weight_power,
+            strat_weight_power,
+        ),
+        result_dir,
     )
 
 

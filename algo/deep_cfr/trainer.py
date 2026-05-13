@@ -53,7 +53,9 @@ from .worker import (
     _init_worker as _worker_init,
     update_nets as _worker_update_nets,
     run_chunk as _worker_run_chunk,
+    run_chunk_to_file as _worker_run_chunk_to_file,
     run_chunk_vectorized as _worker_run_chunk_vectorized,
+    run_chunk_vectorized_to_file as _worker_run_chunk_vectorized_to_file,
     serialize_state_dict as _worker_serialize,
 )
 
@@ -118,6 +120,8 @@ class DeepCFRTrainer:
             raise ValueError(
                 "traversal_backend must be either 'recursive' or 'vectorized'"
             )
+        if cfg.worker_result_transport not in ("ipc", "file"):
+            raise ValueError("worker_result_transport must be either 'ipc' or 'file'")
         if cfg.use_proxy_nets and cfg.proxy_training_steps <= 0:
             raise ValueError("proxy_training_steps must be positive when proxy nets are enabled")
         self.device = _select_device(cfg.device)
@@ -160,6 +164,9 @@ class DeepCFRTrainer:
 
         os.makedirs(cfg.checkpoint_dir, exist_ok=True)
         os.makedirs(cfg.log_dir, exist_ok=True)
+        self._worker_result_dir = os.path.join(cfg.checkpoint_dir, "_worker_results")
+        if cfg.worker_result_transport == "file":
+            os.makedirs(self._worker_result_dir, exist_ok=True)
         self.writer = SummaryWriter(cfg.log_dir)
         self.iter = 0
         self._best_score = -float("inf")
@@ -613,39 +620,41 @@ class DeepCFRTrainer:
         nw = self._pool_workers
         chunk = _traversal_chunk_size(total, nw, cfg.worker_chunk_min)
         tasks = []
-        worker_fn = (
-            _worker_run_chunk_vectorized
-            if self._use_vectorized_traversal()
-            else _worker_run_chunk
-        )
+        use_file_results = cfg.worker_result_transport == "file"
+        if self._use_vectorized_traversal():
+            worker_fn = (
+                _worker_run_chunk_vectorized_to_file
+                if use_file_results else _worker_run_chunk_vectorized
+            )
+        else:
+            worker_fn = _worker_run_chunk_to_file if use_file_results else _worker_run_chunk
         offset = 0
         button_offset = 0
         while offset < total:
             sz = min(chunk, total - offset)
             seed = self.rng.randint(0, 2**31 - 1)
             if self._use_vectorized_traversal():
-                tasks.append((
+                args = [
                     traverser, sz, t, seed, button_offset, cfg.linear_cfr,
                     cfg.vectorized_traversal_batch_size,
                     cfg.discounted_cfr_alpha, cfg.discounted_cfr_gamma,
-                ))
+                ]
             else:
-                tasks.append((
+                args = [
                     traverser, sz, t, seed, button_offset, cfg.linear_cfr,
                     cfg.discounted_cfr_alpha, cfg.discounted_cfr_gamma,
-                ))
+                ]
+            if use_file_results:
+                args.append(self._worker_result_dir)
+            tasks.append(tuple(args))
             offset += sz
             button_offset += sz
         results = pool.starmap(worker_fn, tasks)
-        # Bulk-insert results into reservoirs.
-        adv_buf = self.advantage_buffers[traverser]
-        strat_buf = self.strategy_buffer
-        for (a_obs, a_legal, a_target, a_weight,
-             s_obs, s_legal, s_target, s_weight) in results:
-            if a_obs.shape[0] > 0:
-                adv_buf.add_arrays(a_obs, a_legal, a_target, a_weight)
-            if s_obs.shape[0] > 0:
-                strat_buf.add_arrays(s_obs, s_legal, s_target, s_weight)
+        self._insert_worker_results(
+            results,
+            self.advantage_buffers[traverser],
+            self.strategy_buffer,
+        )
 
     def _dispatch_async_traversals(self, t: int):
         """Async dispatch: returns list of (traverser, AsyncResult) pairs.
@@ -661,11 +670,14 @@ class DeepCFRTrainer:
         total = cfg.traversals_per_iter
         chunk = _traversal_chunk_size(total, nw, cfg.worker_chunk_min)
         pending = []
-        worker_fn = (
-            _worker_run_chunk_vectorized
-            if self._use_vectorized_traversal()
-            else _worker_run_chunk
-        )
+        use_file_results = cfg.worker_result_transport == "file"
+        if self._use_vectorized_traversal():
+            worker_fn = (
+                _worker_run_chunk_vectorized_to_file
+                if use_file_results else _worker_run_chunk_vectorized
+            )
+        else:
+            worker_fn = _worker_run_chunk_to_file if use_file_results else _worker_run_chunk
         for p in range(cfg.num_players):
             tasks = []
             offset = 0
@@ -674,20 +686,61 @@ class DeepCFRTrainer:
                 sz = min(chunk, total - offset)
                 seed = self.rng.randint(0, 2**31 - 1)
                 if self._use_vectorized_traversal():
-                    tasks.append((
+                    args = [
                         p, sz, t, seed, button_offset, cfg.linear_cfr,
                         cfg.vectorized_traversal_batch_size,
                         cfg.discounted_cfr_alpha, cfg.discounted_cfr_gamma,
-                    ))
+                    ]
                 else:
-                    tasks.append((
+                    args = [
                         p, sz, t, seed, button_offset, cfg.linear_cfr,
                         cfg.discounted_cfr_alpha, cfg.discounted_cfr_gamma,
-                    ))
+                    ]
+                if use_file_results:
+                    args.append(self._worker_result_dir)
+                tasks.append(tuple(args))
                 offset += sz
                 button_offset += sz
             pending.append((p, pool.starmap_async(worker_fn, tasks)))
         return PendingTraversalBatch(t, time.time(), pending)
+
+    def _materialize_worker_result(self, result):
+        if not isinstance(result, str):
+            return result
+        path = result
+        try:
+            with np.load(path) as data:
+                return (
+                    data["a_obs"].copy(),
+                    data["a_legal"].copy(),
+                    data["a_target"].copy(),
+                    data["a_weight"].copy(),
+                    data["s_obs"].copy(),
+                    data["s_legal"].copy(),
+                    data["s_target"].copy(),
+                    data["s_weight"].copy(),
+                )
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def _insert_worker_results(
+        self,
+        results,
+        adv_buf: ReservoirBuffer,
+        strat_buf: ReservoirBuffer,
+    ) -> None:
+        for result in results:
+            (
+                a_obs, a_legal, a_target, a_weight,
+                s_obs, s_legal, s_target, s_weight,
+            ) = self._materialize_worker_result(result)
+            if a_obs.shape[0] > 0:
+                adv_buf.add_arrays(a_obs, a_legal, a_target, a_weight)
+            if s_obs.shape[0] > 0:
+                strat_buf.add_arrays(s_obs, s_legal, s_target, s_weight)
 
     def _collect_async_traversals(self, pending: Optional[PendingTraversalBatch]) -> None:
         """Block on async results and insert samples into buffers."""
@@ -697,12 +750,7 @@ class DeepCFRTrainer:
         for p, ar in pending.by_player:
             results = ar.get()
             adv_buf = self.advantage_buffers[p]
-            for (a_obs, a_legal, a_target, a_weight,
-                 s_obs, s_legal, s_target, s_weight) in results:
-                if a_obs.shape[0] > 0:
-                    adv_buf.add_arrays(a_obs, a_legal, a_target, a_weight)
-                if s_obs.shape[0] > 0:
-                    strat_buf.add_arrays(s_obs, s_legal, s_target, s_weight)
+            self._insert_worker_results(results, adv_buf, strat_buf)
 
     # -------------------------------------------------------------------
     # Main loop

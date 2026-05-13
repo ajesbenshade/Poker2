@@ -360,6 +360,37 @@ def test_trainer_runs_with_vectorized_workers_on_cpu(tmp_path):
     assert os.path.exists(os.path.join(cfg.checkpoint_dir, "latest.pt"))
 
 
+def test_trainer_runs_with_file_worker_results_on_cpu(tmp_path):
+    cfg = DeepCFRConfig(
+        num_iterations=2,
+        traversals_per_iter=4,
+        hidden_size=32,
+        num_blocks=1,
+        advantage_buffer_size=256,
+        strategy_buffer_size=256,
+        advantage_train_steps=1,
+        strategy_train_steps=1,
+        train_batch_size=8,
+        eval_interval=0,
+        starting_stack=20,
+        device="cpu",
+        amp_dtype="float32",
+        num_workers=2,
+        worker_chunk_min=2,
+        traversal_backend="vectorized",
+        vectorized_traversal_batch_size=2,
+        worker_result_transport="file",
+        async_pipeline=True,
+        log_dir=str(tmp_path / "runs"),
+        checkpoint_dir=str(tmp_path / "ckpt"),
+    )
+    trainer = DeepCFRTrainer(cfg)
+    trainer.train()
+    result_dir = tmp_path / "ckpt" / "_worker_results"
+    assert trainer.iter == 2
+    assert not list(result_dir.glob("*.npz"))
+
+
 def test_trainer_runs_with_vectorized_proxy_workers_on_cpu(tmp_path):
     cfg = DeepCFRConfig(
         num_iterations=2,
