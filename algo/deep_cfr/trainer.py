@@ -16,6 +16,7 @@ For each iteration ``t = 1..T``:
 from __future__ import annotations
 
 import logging
+import math
 import os
 import random
 import time
@@ -122,6 +123,8 @@ class DeepCFRTrainer:
             )
         if cfg.worker_result_transport not in ("ipc", "file"):
             raise ValueError("worker_result_transport must be either 'ipc' or 'file'")
+        if cfg.lr_schedule not in ("constant", "cosine", "one_cycle"):
+            raise ValueError("lr_schedule must be 'constant', 'cosine', or 'one_cycle'")
         if cfg.use_proxy_nets and cfg.proxy_training_steps <= 0:
             raise ValueError("proxy_training_steps must be positive when proxy nets are enabled")
         self.device = _select_device(cfg.device)
@@ -220,6 +223,35 @@ class DeepCFRTrainer:
             return self.proxy_advantage_nets
         return self.advantage_nets
 
+    def _base_learning_rate(self, loss_kind: str) -> float:
+        if loss_kind == "regression" and self.cfg.advantage_learning_rate is not None:
+            return float(self.cfg.advantage_learning_rate)
+        if loss_kind == "ce_soft" and self.cfg.strategy_learning_rate is not None:
+            return float(self.cfg.strategy_learning_rate)
+        return float(self.cfg.learning_rate)
+
+    def _scheduled_learning_rate(self, base_lr: float, step: int, steps: int) -> float:
+        schedule = self.cfg.lr_schedule
+        if schedule == "constant" or steps <= 1:
+            return base_lr
+        progress = min(1.0, max(0.0, float(step) / float(max(1, steps - 1))))
+        warmup = min(0.95, max(0.0, float(self.cfg.lr_warmup_frac)))
+        min_mult = min(1.0, max(0.0, float(self.cfg.lr_min_mult)))
+        if warmup > 0.0 and progress < warmup:
+            return base_lr * (min_mult + (1.0 - min_mult) * (progress / warmup))
+        if warmup > 0.0:
+            progress = (progress - warmup) / max(1e-8, 1.0 - warmup)
+        if schedule == "cosine":
+            mult = min_mult + 0.5 * (1.0 - min_mult) * (1.0 + math.cos(math.pi * progress))
+            return base_lr * mult
+        # One-cycle inside each optimizer run: ramp up, then cosine-decay.
+        if progress < 0.3:
+            mult = min_mult + (1.0 - min_mult) * (progress / 0.3)
+        else:
+            down = (progress - 0.3) / 0.7
+            mult = min_mult + 0.5 * (1.0 - min_mult) * (1.0 + math.cos(math.pi * down))
+        return base_lr * mult
+
     def _array_to_device(self, array: np.ndarray) -> torch.Tensor:
         tensor = torch.from_numpy(array)
         non_blocking = False
@@ -242,17 +274,31 @@ class DeepCFRTrainer:
         loss_kind: str,   # "regression" | "ce_soft"
     ) -> Dict[str, float]:
         if len(buffer) == 0 or steps <= 0:
-            return {"loss": float("nan"), "steps": 0}
+            return {
+                "loss": float("nan"),
+                "steps": 0,
+                "lr": self._base_learning_rate(loss_kind),
+                "grad_norm": float("nan"),
+                "nonfinite": 0,
+                "entropy": float("nan"),
+            }
         net.train()
+        base_lr = self._base_learning_rate(loss_kind)
         opt = torch.optim.AdamW(
             net.parameters(),
-            lr=self.cfg.learning_rate,
+            lr=base_lr,
             weight_decay=self.cfg.weight_decay,
         )
         bs = min(self.cfg.train_batch_size, len(buffer))
         total_loss = 0.0
         loss_samples = 0
         last_steps = 0
+        last_lr = base_lr
+        grad_norm_total = 0.0
+        grad_norm_samples = 0
+        nonfinite = 0
+        entropy_total = 0.0
+        entropy_samples = 0
         loss_log_interval = max(1, int(self.cfg.loss_log_interval))
 
         # Optional early-stop on held-out validation loss (advantage nets only).
@@ -278,6 +324,9 @@ class DeepCFRTrainer:
             if cfr_plus_clamp:
                 v_target = torch.clamp(v_target, min=0.0)
         for step in range(steps):
+            last_lr = self._scheduled_learning_rate(base_lr, step, steps)
+            for group in opt.param_groups:
+                group["lr"] = last_lr
             obs_np, legal_np, target_np, weight_np = buffer.sample(bs)
             obs = self._array_to_device(obs_np)
             legal = self._array_to_device(legal_np)
@@ -308,15 +357,29 @@ class DeepCFRTrainer:
                     log_probs = F.log_softmax(masked_logits, dim=-1)
                     log_probs = torch.nan_to_num(log_probs, nan=0.0,
                                                 neginf=0.0, posinf=0.0)
+                    probs = torch.exp(log_probs) * legal
                     target_norm = target * legal
                     s = target_norm.sum(dim=-1, keepdim=True).clamp_min(1e-8)
                     target_norm = target_norm / s
                     per_sample = -(target_norm * log_probs).sum(dim=-1)
                     loss = (per_sample * weight).sum() / w_sum
+                    entropy = -(probs * log_probs).sum(dim=-1)
+                    entropy_total += float(((entropy * weight).sum() / w_sum).detach())
+                    entropy_samples += 1
                 else:
                     raise ValueError(loss_kind)
+            if not torch.isfinite(loss):
+                nonfinite += 1
+                logger.warning(
+                    "non-finite Deep CFR loss; stopping %s training at step %d/%d",
+                    loss_kind, step + 1, steps,
+                )
+                break
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(net.parameters(), self.cfg.grad_clip)
+            grad_norm = torch.nn.utils.clip_grad_norm_(net.parameters(), self.cfg.grad_clip)
+            if torch.isfinite(grad_norm):
+                grad_norm_total += float(grad_norm)
+                grad_norm_samples += 1
             opt.step()
             if (step + 1) % loss_log_interval == 0 or step + 1 == steps:
                 total_loss += float(loss.detach())
@@ -338,7 +401,14 @@ class DeepCFRTrainer:
                         break
                 net.train()
         net.eval()
-        return {"loss": total_loss / max(1, loss_samples), "steps": last_steps}
+        return {
+            "loss": total_loss / max(1, loss_samples),
+            "steps": last_steps,
+            "lr": last_lr,
+            "grad_norm": grad_norm_total / max(1, grad_norm_samples),
+            "nonfinite": nonfinite,
+            "entropy": entropy_total / max(1, entropy_samples) if entropy_samples else float("nan"),
+        }
 
     def _train_net_on_stream(
         self,
@@ -415,7 +485,7 @@ class DeepCFRTrainer:
                 buffer=self.advantage_buffers[p],
                 steps=self.cfg.proxy_training_steps,
                 batch_size=self.cfg.train_batch_size,
-                learning_rate=self.cfg.learning_rate,
+                learning_rate=self._base_learning_rate("regression"),
                 weight_decay=self.cfg.weight_decay,
                 grad_clip=self.cfg.grad_clip,
                 device=self.device,
@@ -760,23 +830,35 @@ class DeepCFRTrainer:
         cfg = self.cfg
         logger.info(
             "deep_cfr start | iters=%d | traversals/iter/player=%d | players=%d | "
-            "stack=%d | bb=%d | sizes=%s | obs=%d | actions=%d | device=%s | backend=%s",
+            "start_iter=%d | stack=%d | bb=%d | sizes=%s | obs=%d | actions=%d | "
+            "device=%s | backend=%s | lr=%.4g/%.4g | schedule=%s",
             cfg.num_iterations, cfg.traversals_per_iter, cfg.num_players,
-            cfg.starting_stack, cfg.big_blind, cfg.bet_fractions, OBS_DIM,
+            self.iter, cfg.starting_stack, cfg.big_blind, cfg.bet_fractions, OBS_DIM,
             self.num_actions, self.device, cfg.traversal_backend,
+            self._base_learning_rate("regression"), self._base_learning_rate("ce_soft"),
+            cfg.lr_schedule,
         )
+        start_iter = int(self.iter)
+        if start_iter >= cfg.num_iterations:
+            logger.warning(
+                "deep_cfr no-op: start_iter=%d is already >= configured num_iterations=%d",
+                start_iter, cfg.num_iterations,
+            )
+            self.writer.close()
+            return
+        first_iter = start_iter + 1
         pending_batches = deque()
-        next_async_iter = 2
+        next_async_iter = first_iter + 1
         async_depth = max(1, int(cfg.async_pipeline_depth))
 
-        for t in range(1, cfg.num_iterations + 1):
+        for t in range(first_iter, cfg.num_iterations + 1):
             self.iter = t
             iter_start = time.time()
 
             use_async = (
                 cfg.async_pipeline
                 and cfg.num_workers > 0
-                and t > 1   # iter 1 must be sync to populate buffers first
+                and t > first_iter   # first iter must be sync to populate buffers first
             )
 
             # 1) Run external sampling for each traverser
@@ -802,6 +884,13 @@ class DeepCFRTrainer:
             for p, stats in enumerate(adv_stats):
                 adv_losses.append(stats["loss"])
                 self.writer.add_scalar(f"loss/advantage_p{p}", stats["loss"], t)
+                self.writer.add_scalar(f"lr/advantage_p{p}", stats.get("lr", float("nan")), t)
+                self.writer.add_scalar(
+                    f"grad_norm/advantage_p{p}", stats.get("grad_norm", float("nan")), t
+                )
+                self.writer.add_scalar(
+                    f"loss/nonfinite_advantage_p{p}", stats.get("nonfinite", 0), t
+                )
                 self.writer.add_scalar(f"buffer/advantage_p{p}",
                                        len(self.advantage_buffers[p]), t)
 
@@ -826,6 +915,10 @@ class DeepCFRTrainer:
                 )
                 policy_loss = stats["loss"]
                 self.writer.add_scalar("loss/policy", policy_loss, t)
+                self.writer.add_scalar("lr/policy", stats.get("lr", float("nan")), t)
+                self.writer.add_scalar("grad_norm/policy", stats.get("grad_norm", float("nan")), t)
+                self.writer.add_scalar("policy/entropy", stats.get("entropy", float("nan")), t)
+                self.writer.add_scalar("loss/nonfinite_policy", stats.get("nonfinite", 0), t)
                 self.writer.add_scalar("buffer/strategy",
                                        len(self.strategy_buffer), t)
 
@@ -905,6 +998,77 @@ class DeepCFRTrainer:
     # Checkpoint
     # -------------------------------------------------------------------
 
+    def load_checkpoint(
+        self,
+        path: str,
+        *,
+        restore_iteration: bool = False,
+        restore_buffers: bool = False,
+    ) -> Dict:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+
+        def _strip(sd):
+            out = {}
+            for k, v in sd.items():
+                if k.startswith("_orig_mod."):
+                    k = k[len("_orig_mod."):]
+                out[k] = v
+            return out
+
+        self.policy_net.load_state_dict(_strip(payload["policy_net"]))
+        self.policy_net.to(self.device)
+        self.policy_net.eval()
+
+        for p, sd in enumerate(payload.get("advantage_nets", [])):
+            if p >= self.cfg.num_players or sd is None:
+                continue
+            if self.advantage_nets[p] is None:
+                self.advantage_nets[p] = self._make_advantage_net()
+            self.advantage_nets[p].load_state_dict(_strip(sd))
+            self.advantage_nets[p].to(self.device)
+            self.advantage_nets[p].eval()
+
+        for p, sd in enumerate(payload.get("proxy_advantage_nets", [])):
+            if p >= self.cfg.num_players or sd is None:
+                continue
+            if self.proxy_advantage_nets[p] is None:
+                self.proxy_advantage_nets[p] = self._make_proxy_net()
+            self.proxy_advantage_nets[p].load_state_dict(_strip(sd))
+            self.proxy_advantage_nets[p].to(self.device)
+            self.proxy_advantage_nets[p].eval()
+
+        restored_buffers = False
+        buffers = payload.get("buffers")
+        if restore_buffers and buffers is not None:
+            for p, state in enumerate(buffers.get("advantage", [])):
+                if p < self.cfg.num_players:
+                    self.advantage_buffers[p].load_state_dict(state)
+            strategy_state = buffers.get("strategy")
+            if strategy_state is not None:
+                self.strategy_buffer.load_state_dict(strategy_state)
+            restored_buffers = True
+        elif restore_buffers:
+            logger.warning(
+                "checkpoint %s has no buffer state; continuing as a warm start",
+                path,
+            )
+
+        if restore_iteration:
+            self.iter = int(payload.get("iter", 0))
+        else:
+            self.iter = 0
+
+        meta = payload.get("meta", {}) or {}
+        if "score_mbbg" in meta:
+            self._best_score = float(meta["score_mbbg"])
+        if "lbr_mbbg" in meta:
+            self._best_lbr = float(meta["lbr_mbbg"])
+        logger.info(
+            "loaded Deep CFR checkpoint %s | iter=%d | restore_iteration=%s | buffers=%s",
+            path, int(payload.get("iter", 0)), restore_iteration, restored_buffers,
+        )
+        return payload
+
     def save_checkpoint(self, path: str, meta: Optional[Dict] = None) -> None:
         def _strip(sd):
             out = {}
@@ -927,7 +1091,13 @@ class DeepCFRTrainer:
             "iter": self.iter,
             "config": self.cfg.__dict__,
             "meta": meta or {},
+            "buffer_state_saved": bool(self.cfg.save_buffer_state),
         }
+        if self.cfg.save_buffer_state:
+            payload["buffers"] = {
+                "advantage": [buf.state_dict() for buf in self.advantage_buffers],
+                "strategy": self.strategy_buffer.state_dict(),
+            }
         torch.save(payload, path)
 
 

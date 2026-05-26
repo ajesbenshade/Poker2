@@ -60,6 +60,23 @@ def test_reservoir_replaces_above_capacity():
     assert buf.total_seen == 50
 
 
+def test_reservoir_state_dict_roundtrip():
+    buf = ReservoirBuffer(capacity=10, obs_dim=3, num_actions=2, seed=7)
+    for i in range(8):
+        buf.add(np.full(3, i, np.float32), np.ones(2, np.float32),
+                np.full(2, i + 1, np.float32), float(i))
+
+    clone = ReservoirBuffer(capacity=10, obs_dim=3, num_actions=2, seed=99)
+    clone.load_state_dict(buf.state_dict())
+
+    assert len(clone) == len(buf)
+    assert clone.total_seen == buf.total_seen
+    np.testing.assert_array_equal(clone._obs[:len(buf)], buf._obs[:len(buf)])
+    np.testing.assert_array_equal(clone._legal[:len(buf)], buf._legal[:len(buf)])
+    np.testing.assert_array_equal(clone._target[:len(buf)], buf._target[:len(buf)])
+    np.testing.assert_array_equal(clone._weight[:len(buf)], buf._weight[:len(buf)])
+
+
 # ---------------------------------------------------------------------------
 # Regret matching
 # ---------------------------------------------------------------------------
@@ -273,6 +290,109 @@ def test_trainer_runs_one_iteration(tmp_path):
     # latest.pt should exist
     import os
     assert os.path.exists(os.path.join(cfg.checkpoint_dir, "latest.pt"))
+
+
+def test_trainer_load_checkpoint_warm_start(tmp_path):
+    cfg = DeepCFRConfig(
+        num_iterations=1,
+        traversals_per_iter=4,
+        hidden_size=32,
+        num_blocks=1,
+        advantage_buffer_size=256,
+        strategy_buffer_size=256,
+        advantage_train_steps=1,
+        strategy_train_steps=1,
+        train_batch_size=8,
+        eval_interval=0,
+        starting_stack=20,
+        device="cpu",
+        amp_dtype="float32",
+        log_dir=str(tmp_path / "runs_a"),
+        checkpoint_dir=str(tmp_path / "ckpt_a"),
+    )
+    trainer = DeepCFRTrainer(cfg)
+    trainer.train()
+
+    clone_cfg = DeepCFRConfig(
+        num_iterations=1,
+        hidden_size=32,
+        num_blocks=1,
+        device="cpu",
+        amp_dtype="float32",
+        log_dir=str(tmp_path / "runs_b"),
+        checkpoint_dir=str(tmp_path / "ckpt_b"),
+    )
+    clone = DeepCFRTrainer(clone_cfg)
+    clone.load_checkpoint(str(tmp_path / "ckpt_a" / "latest.pt"), restore_iteration=False)
+
+    assert clone.iter == 0
+    for key, value in trainer.policy_net.state_dict().items():
+        torch.testing.assert_close(clone.policy_net.state_dict()[key], value)
+
+
+def test_trainer_resume_checkpoint_iteration(tmp_path):
+    cfg = DeepCFRConfig(
+        num_iterations=1,
+        traversals_per_iter=4,
+        hidden_size=32,
+        num_blocks=1,
+        advantage_buffer_size=256,
+        strategy_buffer_size=256,
+        advantage_train_steps=1,
+        strategy_train_steps=1,
+        train_batch_size=8,
+        eval_interval=0,
+        starting_stack=20,
+        device="cpu",
+        amp_dtype="float32",
+        save_buffer_state=True,
+        log_dir=str(tmp_path / "runs_a"),
+        checkpoint_dir=str(tmp_path / "ckpt_a"),
+    )
+    trainer = DeepCFRTrainer(cfg)
+    trainer.train()
+
+    resume_cfg = DeepCFRConfig(
+        num_iterations=2,
+        traversals_per_iter=4,
+        hidden_size=32,
+        num_blocks=1,
+        advantage_buffer_size=256,
+        strategy_buffer_size=256,
+        advantage_train_steps=1,
+        strategy_train_steps=1,
+        train_batch_size=8,
+        eval_interval=0,
+        starting_stack=20,
+        device="cpu",
+        amp_dtype="float32",
+        log_dir=str(tmp_path / "runs_b"),
+        checkpoint_dir=str(tmp_path / "ckpt_b"),
+    )
+    resumed = DeepCFRTrainer(resume_cfg)
+    resumed.load_checkpoint(
+        str(tmp_path / "ckpt_a" / "latest.pt"),
+        restore_iteration=True,
+        restore_buffers=True,
+    )
+    resumed.train()
+
+    assert resumed.iter == 2
+    assert len(resumed.strategy_buffer) > 0
+
+
+def test_trainer_uses_split_learning_rates():
+    cfg = DeepCFRConfig(
+        learning_rate=1e-3,
+        advantage_learning_rate=3e-3,
+        strategy_learning_rate=2e-3,
+        lr_schedule="cosine",
+        device="cpu",
+    )
+    trainer = DeepCFRTrainer(cfg)
+    assert trainer._base_learning_rate("regression") == pytest.approx(3e-3)
+    assert trainer._base_learning_rate("ce_soft") == pytest.approx(2e-3)
+    assert trainer._scheduled_learning_rate(1.0, 9, 10) == pytest.approx(cfg.lr_min_mult)
 
 
 def test_trainer_runs_with_optimization_flags_on_cpu(tmp_path):
@@ -870,6 +990,23 @@ def test_evaluate_vs_baselines_6max_runs():
     out = evaluate_vs_baselines(net, cfg, torch.device("cpu"),
                                  num_hands=24, rng=random.Random(0))
     assert set(out.keys()) == {"random", "call_station", "tight_aggressive"}
+    for v in out.values():
+        assert np.isfinite(v)
+
+
+def test_evaluate_vs_human_like_baselines_runs():
+    from algo.deep_cfr import evaluate_vs_baselines
+    cfg = DeepCFRConfig()
+    aspace = ActionSpace(cfg.bet_fractions)
+    net = PolicyNet(obs_dim=OBS_DIM, num_actions=aspace.num_actions,
+                    hidden=64, num_blocks=1).to(torch.device("cpu"))
+    net.eval()
+    out = evaluate_vs_baselines(
+        net, cfg, torch.device("cpu"),
+        num_hands=20, rng=random.Random(0), include_human_like=True,
+    )
+    assert {"loose_passive", "loose_aggressive", "overfolder",
+            "bluff_catcher", "pot_pressure"}.issubset(out)
     for v in out.values():
         assert np.isfinite(v)
 

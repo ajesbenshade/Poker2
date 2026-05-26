@@ -21,7 +21,7 @@ from engine import (
     new_hand,
     payoffs,
 )
-from engine.actions import ActionSpace, all_in_id, check_call_id, fold_id
+from engine.actions import ActionSpace, all_in_id, bet_id, check_call_id, fold_id
 
 from .config import DeepCFRConfig
 from .network import PolicyNet
@@ -75,10 +75,92 @@ def tight_aggressive(state: GameState, seat: int, rng: random.Random) -> int:
     return check_call_id()
 
 
+def _first_legal(mask, candidates):
+    for action in candidates:
+        if 0 <= action < len(mask) and mask[action]:
+            return action
+    return next(i for i, m in enumerate(mask) if m)
+
+
+def _hand_features(state: GameState, seat: int) -> tuple[bool, int, bool]:
+    from engine.cards import rank_of
+    h0, h1 = state.hole_cards[seat]
+    r0, r1 = rank_of(h0), rank_of(h1)
+    pair = r0 == r1
+    high = max(r0, r1)
+    connectedish = abs(r0 - r1) <= 2
+    return pair, high, connectedish
+
+
+def loose_passive(state: GameState, seat: int, rng: random.Random) -> int:
+    mask = legal_action_mask(state)
+    pair, high, connectedish = _hand_features(state, seat)
+    to_call = state.call_amount(seat)
+    if to_call == 0:
+        return check_call_id()
+    if to_call <= state.big_blind * 4 or pair or high >= 9 or connectedish:
+        return check_call_id() if mask[check_call_id()] else _first_legal(mask, [])
+    return fold_id() if mask[fold_id()] else check_call_id()
+
+
+def loose_aggressive(state: GameState, seat: int, rng: random.Random) -> int:
+    mask = legal_action_mask(state)
+    pair, high, connectedish = _hand_features(state, seat)
+    pressure = pair or high >= 9 or connectedish or rng.random() < 0.25
+    if pressure:
+        return _first_legal(mask, [bet_id(3), bet_id(2), all_in_id(), check_call_id()])
+    if state.call_amount(seat) <= state.big_blind * 2:
+        return check_call_id() if mask[check_call_id()] else _first_legal(mask, [])
+    return fold_id() if mask[fold_id()] else check_call_id()
+
+
+def overfolder(state: GameState, seat: int, rng: random.Random) -> int:
+    mask = legal_action_mask(state)
+    pair, high, _ = _hand_features(state, seat)
+    to_call = state.call_amount(seat)
+    if to_call == 0:
+        return _first_legal(mask, [bet_id(1), check_call_id()]) if high >= 11 or pair else check_call_id()
+    if pair and high >= 10 and to_call <= 0.5 * max(1, state.pot):
+        return check_call_id()
+    return fold_id() if mask[fold_id()] else check_call_id()
+
+
+def bluff_catcher(state: GameState, seat: int, rng: random.Random) -> int:
+    mask = legal_action_mask(state)
+    pair, high, _ = _hand_features(state, seat)
+    to_call = state.call_amount(seat)
+    if to_call == 0:
+        return check_call_id()
+    if pair or high >= 10 or to_call <= 0.33 * max(1, state.pot):
+        return check_call_id() if mask[check_call_id()] else _first_legal(mask, [])
+    return fold_id() if mask[fold_id()] else check_call_id()
+
+
+def pot_pressure(state: GameState, seat: int, rng: random.Random) -> int:
+    mask = legal_action_mask(state)
+    pair, high, _ = _hand_features(state, seat)
+    strong = pair or high >= 11
+    if state.call_amount(seat) == 0:
+        return _first_legal(mask, [bet_id(3), bet_id(2), check_call_id()])
+    if strong:
+        return _first_legal(mask, [bet_id(3), bet_id(2), all_in_id(), check_call_id()])
+    if state.call_amount(seat) <= 0.25 * max(1, state.pot):
+        return check_call_id() if mask[check_call_id()] else _first_legal(mask, [])
+    return fold_id() if mask[fold_id()] else check_call_id()
+
+
 BASELINES: Dict[str, Policy] = {
     "random": random_policy,
     "call_station": call_station,
     "tight_aggressive": tight_aggressive,
+}
+
+HUMAN_LIKE_BASELINES: Dict[str, Policy] = {
+    "loose_passive": loose_passive,
+    "loose_aggressive": loose_aggressive,
+    "overfolder": overfolder,
+    "bluff_catcher": bluff_catcher,
+    "pot_pressure": pot_pressure,
 }
 
 
@@ -175,6 +257,8 @@ def evaluate_vs_baselines(
     device: torch.device,
     num_hands: Optional[int] = None,
     rng: Optional[random.Random] = None,
+    baselines: Optional[Dict[str, Policy]] = None,
+    include_human_like: bool = False,
 ) -> Dict[str, float]:
     """Run trained policy vs each baseline. Returns ``{name: mbb_per_game}``.
 
@@ -192,7 +276,10 @@ def evaluate_vs_baselines(
     trained = policy_from_net(net, device, deterministic=False)
     np_ = cfg.num_players
     results: Dict[str, float] = {}
-    for name, baseline in BASELINES.items():
+    chosen_baselines = dict(BASELINES if baselines is None else baselines)
+    if include_human_like:
+        chosen_baselines.update(HUMAN_LIKE_BASELINES)
+    for name, baseline in chosen_baselines.items():
         if np_ == 2:
             a = play_match([trained, baseline], n, cfg, rng=random.Random(rng.random()))
             b = play_match([baseline, trained], n, cfg, rng=random.Random(rng.random()))

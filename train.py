@@ -148,6 +148,21 @@ def parse_args():
     parser.add_argument("--cfr-strat-steps", dest="cfr_strat_steps", type=int, default=None)
     parser.add_argument("--cfr-batch-size", dest="cfr_batch_size", type=int, default=None)
     parser.add_argument("--cfr-lr", dest="cfr_lr", type=float, default=None)
+    parser.add_argument("--cfr-adv-lr", dest="cfr_adv_lr", type=float, default=None,
+                        help="Deep CFR advantage-net learning rate (defaults to --cfr-lr)")
+    parser.add_argument("--cfr-strat-lr", dest="cfr_strat_lr", type=float, default=None,
+                        help="Deep CFR average-policy learning rate (defaults to --cfr-lr)")
+    parser.add_argument("--cfr-lr-schedule", dest="cfr_lr_schedule",
+                        choices=("constant", "cosine", "one_cycle"), default=None,
+                        help="Per-optimizer Deep CFR LR schedule")
+    parser.add_argument("--cfr-lr-min-mult", dest="cfr_lr_min_mult", type=float, default=None,
+                        help="Minimum LR multiplier for Deep CFR schedules")
+    parser.add_argument("--cfr-lr-warmup-frac", dest="cfr_lr_warmup_frac", type=float, default=None,
+                        help="Fraction of each Deep CFR optimizer run spent warming up")
+    parser.add_argument("--cfr-init-checkpoint", dest="cfr_init_checkpoint", type=str, default=None,
+                        help="Warm-start Deep CFR model weights from a checkpoint without restoring iteration")
+    parser.add_argument("--cfr-save-buffers", dest="cfr_save_buffers", action="store_true",
+                        help="Include Deep CFR reservoir buffers in checkpoints; can be very large")
     parser.add_argument("--cfr-num-workers", dest="cfr_num_workers", type=int, default=None,
                         help="Worker processes for parallel CFR traversals (0=serial)")
     parser.add_argument("--cfr-worker-chunk", dest="cfr_worker_chunk", type=int, default=None,
@@ -692,6 +707,22 @@ def train_deep_cfr(args):
         cfg.train_batch_size = int(args.cfr_batch_size)
     if args.cfr_lr is not None:
         cfg.learning_rate = float(args.cfr_lr)
+    if args.cfr_adv_lr is not None:
+        cfg.advantage_learning_rate = float(args.cfr_adv_lr)
+    if args.cfr_strat_lr is not None:
+        cfg.strategy_learning_rate = float(args.cfr_strat_lr)
+    if args.cfr_lr_schedule is not None:
+        cfg.lr_schedule = str(args.cfr_lr_schedule)
+    if args.cfr_lr_min_mult is not None:
+        cfg.lr_min_mult = float(args.cfr_lr_min_mult)
+    if args.cfr_lr_warmup_frac is not None:
+        cfg.lr_warmup_frac = float(args.cfr_lr_warmup_frac)
+    if args.cfr_init_checkpoint is not None:
+        cfg.init_checkpoint = str(args.cfr_init_checkpoint)
+    if args.resume_checkpoint is not None:
+        cfg.resume_checkpoint = str(args.resume_checkpoint)
+    if args.cfr_save_buffers:
+        cfg.save_buffer_state = True
     if args.cfr_num_workers is not None:
         cfg.num_workers = int(args.cfr_num_workers)
     if args.cfr_worker_chunk is not None:
@@ -773,17 +804,41 @@ def train_deep_cfr(args):
         )
     cfg.seed = int(args.seed)
 
+    checkpoint_for_shape = cfg.init_checkpoint or cfg.resume_checkpoint
+    if checkpoint_for_shape:
+        payload = torch.load(checkpoint_for_shape, map_location="cpu", weights_only=False)
+        raw_cfg = payload.get("config", {}) or {}
+        if args.cfr_hidden is None and "hidden_size" in raw_cfg:
+            cfg.hidden_size = int(raw_cfg["hidden_size"])
+        if args.cfr_blocks is None and "num_blocks" in raw_cfg:
+            cfg.num_blocks = int(raw_cfg["num_blocks"])
+        if args.players is None and "num_players" in raw_cfg:
+            cfg.num_players = int(raw_cfg["num_players"])
+        if "bet_fractions" in raw_cfg:
+            cfg.bet_fractions = tuple(raw_cfg["bet_fractions"])
+        if "dropout" in raw_cfg:
+            cfg.dropout = float(raw_cfg["dropout"])
+
     logger.info(
         "DEEP CFR | players=%d | iters=%d | traversals/iter/p=%d | hidden=%d | blocks=%d | "
-        "stack=%d (%d BB) | adv_steps=%d | strat_steps=%d | bs=%d | lr=%.4g | eval_every=%d (%d hands) | backend=%s | proxy=%s | seed=%d",
+        "stack=%d (%d BB) | adv_steps=%d | strat_steps=%d | bs=%d | lr=%.4g/%.4g | "
+        "schedule=%s | eval_every=%d (%d hands) | backend=%s | proxy=%s | seed=%d",
         cfg.num_players, cfg.num_iterations, cfg.traversals_per_iter,
         cfg.hidden_size, cfg.num_blocks, cfg.starting_stack,
         cfg.starting_stack // cfg.big_blind, cfg.advantage_train_steps,
-        cfg.strategy_train_steps, cfg.train_batch_size, cfg.learning_rate,
+        cfg.strategy_train_steps, cfg.train_batch_size,
+        cfg.advantage_learning_rate if cfg.advantage_learning_rate is not None else cfg.learning_rate,
+        cfg.strategy_learning_rate if cfg.strategy_learning_rate is not None else cfg.learning_rate,
+        cfg.lr_schedule,
         cfg.eval_interval, cfg.eval_hands, cfg.traversal_backend,
         int(cfg.use_proxy_nets), cfg.seed,
     )
-    DeepCFRTrainer(cfg).train()
+    trainer = DeepCFRTrainer(cfg)
+    if cfg.resume_checkpoint:
+        trainer.load_checkpoint(cfg.resume_checkpoint, restore_iteration=True, restore_buffers=True)
+    elif cfg.init_checkpoint:
+        trainer.load_checkpoint(cfg.init_checkpoint, restore_iteration=False, restore_buffers=False)
+    trainer.train()
 
 
 def main():

@@ -156,3 +156,47 @@ class ReservoirBuffer:
         with self._lock:
             self._size = 0
             self._seen = 0
+
+    def state_dict(self) -> dict:
+        with self._lock:
+            return {
+                "capacity": self.capacity,
+                "obs_dim": self.obs_dim,
+                "num_actions": self.num_actions,
+                "target_dim": self.target_dim,
+                "size": self._size,
+                "seen": self._seen,
+                "obs": self._obs[:self._size].copy(),
+                "legal": self._legal[:self._size].copy(),
+                "target": self._target[:self._size].copy(),
+                "weight": self._weight[:self._size].copy(),
+                "rng_state": self._rng.bit_generator.state,
+            }
+
+    def load_state_dict(self, state: dict) -> None:
+        size = int(state["size"])
+        if int(state["obs_dim"]) != self.obs_dim:
+            raise ValueError("buffer obs_dim mismatch")
+        if int(state["num_actions"]) != self.num_actions:
+            raise ValueError("buffer num_actions mismatch")
+        if int(state["target_dim"]) != self.target_dim:
+            raise ValueError("buffer target_dim mismatch")
+        if size > self.capacity:
+            raise ValueError(
+                f"checkpoint buffer size {size} exceeds capacity {self.capacity}"
+            )
+        with self._lock:
+            self._obs.fill(0.0)
+            self._legal.fill(0.0)
+            self._target.fill(0.0)
+            self._weight.fill(0.0)
+            if size > 0:
+                self._obs[:size] = state["obs"]
+                self._legal[:size] = state["legal"]
+                self._target[:size] = state["target"]
+                self._weight[:size] = state["weight"]
+            self._size = size
+            self._seen = int(state["seen"])
+            rng_state = state.get("rng_state")
+            if rng_state is not None:
+                self._rng.bit_generator.state = rng_state

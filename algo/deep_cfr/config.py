@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Tuple
+from typing import Optional, Tuple
 
 from engine.actions import DEFAULT_BET_FRACTIONS
 
@@ -46,6 +46,11 @@ class DeepCFRConfig:
     strategy_train_steps: int = 8000
     train_batch_size: int = 4096
     learning_rate: float = 1e-3
+    advantage_learning_rate: Optional[float] = None
+    strategy_learning_rate: Optional[float] = None
+    lr_schedule: str = "constant"       # "constant" | "cosine" | "one_cycle"
+    lr_min_mult: float = 0.1
+    lr_warmup_frac: float = 0.0
     weight_decay: float = 1e-4
     grad_clip: float = 1.0
     reset_advantage_net_each_iter: bool = True   # standard Deep CFR resets V each iter
@@ -81,6 +86,9 @@ class DeepCFRConfig:
     log_dir: str = "runs/deep_cfr"
     log_interval: int = 1
     latest_checkpoint_interval: int = 1          # save latest.pt every N iters (1=every iter)
+    init_checkpoint: Optional[str] = None         # load weights only; train for num_iterations
+    resume_checkpoint: Optional[str] = None       # load iter/buffers when present; continue to num_iterations
+    save_buffer_state: bool = False              # can make checkpoints many GB for large buffers
 
     # Parallel traversal (Phase A)
     # RX 7900 XT ROCm guidance: keep 0 for serial smoke tests, use 8 workers
