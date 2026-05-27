@@ -96,16 +96,18 @@ class DeepCFRConfig:
     # 14-16 only for aggressive runs while monitoring RAM/VRAM.
     num_workers: int = 0               # 0 => serial (legacy path); >0 => process pool
     worker_chunk_min: int = 0          # 0=auto; >0 target traversals per dispatched chunk
+    min_tasks_per_worker: int = 4      # When auto chunking, aim for at least this many tasks per worker for load balancing (post fast-sim + sharedmem era)
     worker_torch_threads: int = 1      # per-worker torch CPU thread count
     script_worker_nets: bool = False   # torch.jit.script CPU worker advantage nets
     traversal_backend: str = "recursive"  # "recursive" | "vectorized"
-    vectorized_traversal_batch_size: int = 64
-    worker_result_transport: str = "ipc"  # "ipc" | "file" for large chunk payloads
+    vectorized_traversal_batch_size: int = 128  # Inner batch size for vectorized traversal (larger is often better after fast simulator)
+    worker_result_transport: str = "ipc"  # "ipc" | "file" | "sharedmem" (recommended for local multi-worker)
     use_proxy_nets: bool = False       # distill smaller traversal-only advantage nets
     proxy_hidden_size: int = 128
     proxy_num_blocks: int = 2
     proxy_refresh_interval: int = 5
     proxy_training_steps: int = 2000
+    proxy_distill_strategy_weight: float = 0.4   # Weight on strategy (regret-matching) matching loss vs pure advantage MSE during proxy distillation. 0 = advantage only, higher = better strategy fidelity for traversal.
     traversal_inference_mode: str = "worker_cpu"  # "worker_cpu" | "server"
     inference_server_batch_size: int = 128
     inference_server_timeout_ms: float = 2.0

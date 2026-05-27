@@ -38,6 +38,7 @@ from .traversal import (
     traverse_one,
 )
 from .vectorized_traversal import traverse_many_vectorized
+from .sharedmem_transport import pack_results_to_sharedmem
 
 
 # Module-level state, populated by ``_init_worker``.
@@ -389,6 +390,43 @@ def run_chunk_vectorized_to_file(
     )
 
 
+def run_chunk_sharedmem(
+    traverser: int,
+    chunk_size: int,
+    iter_t: int,
+    base_seed: int,
+    button_offset: int,
+    linear_weight: bool,
+    adv_weight_power: float = 1.0,
+    strat_weight_power: float = 1.0,
+) -> Tuple[str, int]:
+    """Run a (non-vectorized) chunk and return a shared memory descriptor."""
+    result = run_chunk(
+        traverser, chunk_size, iter_t, base_seed, button_offset,
+        linear_weight, adv_weight_power, strat_weight_power
+    )
+    return _pack_result_sharedmem(result)
+
+
+def run_chunk_vectorized_sharedmem(
+    traverser: int,
+    chunk_size: int,
+    iter_t: int,
+    base_seed: int,
+    button_offset: int,
+    linear_weight: bool,
+    vectorized_batch_size: int,
+    adv_weight_power: float = 1.0,
+    strat_weight_power: float = 1.0,
+) -> Tuple[str, int]:
+    """Run a vectorized chunk and return a shared memory descriptor (name, size)."""
+    result = run_chunk_vectorized(
+        traverser, chunk_size, iter_t, base_seed, button_offset,
+        linear_weight, vectorized_batch_size, adv_weight_power, strat_weight_power
+    )
+    return _pack_result_sharedmem(result)
+
+
 def serialize_state_dict(net: Optional[AdvantageNet]) -> Optional[bytes]:
     """Pickle a net's CPU state_dict to bytes for IPC to workers."""
     if net is None:
@@ -403,3 +441,17 @@ def serialize_state_dict(net: Optional[AdvantageNet]) -> Optional[bytes]:
     buf = io.BytesIO()
     torch.save(sd, buf)
     return buf.getvalue()
+
+
+# -----------------------------------------------------------------------------
+# Shared memory result packaging (new high-performance transport)
+# -----------------------------------------------------------------------------
+
+def _pack_result_sharedmem(
+    result: Tuple[
+        np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+        np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+    ],
+) -> Tuple[str, int]:
+    """Pack the 8 result arrays into shared memory. Returns (name, size)."""
+    return pack_results_to_sharedmem(result)

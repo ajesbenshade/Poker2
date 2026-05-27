@@ -57,8 +57,12 @@ from .worker import (
     run_chunk_to_file as _worker_run_chunk_to_file,
     run_chunk_vectorized as _worker_run_chunk_vectorized,
     run_chunk_vectorized_to_file as _worker_run_chunk_vectorized_to_file,
+    run_chunk_sharedmem as _worker_run_chunk_sharedmem,
+    run_chunk_vectorized_sharedmem as _worker_run_chunk_vectorized_sharedmem,
     serialize_state_dict as _worker_serialize,
 )
+from .sharedmem_transport import load_results_from_sharedmem
+from .batch_stager import PinnedBatchStager, make_stager_from_config
 
 logger = logging.getLogger(__name__)
 
@@ -70,20 +74,59 @@ class PendingTraversalBatch:
     by_player: List[tuple]
 
 
-def _traversal_chunk_size(total: int, num_workers: int, configured_chunk: int) -> int:
+def _traversal_chunk_size(
+    total: int,
+    num_workers: int,
+    configured_chunk: int,
+    min_tasks_per_worker: int = 4,
+) -> int:
     """Choose traversal task size for multiprocessing dispatch.
 
-    ``configured_chunk`` is intentionally a target task size, not a minimum:
-    smaller tasks give the pool enough work units to smooth out variable game
-    tree depth across workers. ``0`` keeps the old auto behavior of roughly one
-    task per worker.
+    Modern (post fast-sim + sharedmem) version:
+    - If user sets worker_chunk_min > 0, respect it (but never exceed total).
+    - Otherwise, aim for at least `min_tasks_per_worker` tasks per worker.
+      This gives the pool enough parallelism to hide variance in hand depth
+      and simulation time, especially important now that individual traversals
+      are much faster.
     """
     total = max(1, int(total))
     num_workers = max(1, int(num_workers))
     configured_chunk = int(configured_chunk)
+    min_tasks = max(1, int(min_tasks_per_worker))
+
     if configured_chunk > 0:
         return min(total, configured_chunk)
-    return max(1, (total + num_workers - 1) // num_workers)
+
+    # Target a healthy number of tasks for good load balancing
+    target_tasks = max(num_workers * min_tasks, num_workers)
+    if target_tasks <= 0:
+        target_tasks = num_workers
+
+    ideal_chunk = max(1, (total + target_tasks - 1) // target_tasks)
+
+    # Never create more tasks than total traversals
+    return min(total, ideal_chunk)
+
+
+def _effective_vectorized_batch_size(
+    requested: int,
+    total_traversals: int,
+    num_workers: int,
+) -> int:
+    """Suggest a good inner vectorized batch size.
+
+    With the fast simulator (Priority 1), larger inner batches are often better
+    because we amortize Python recursion overhead and get better batched NN
+    efficiency during traversal.
+    """
+    requested = max(1, int(requested))
+    # Heuristic: at least 64-256 is good for most models once simulation is fast
+    suggested = max(requested, 128)
+    # Don't make it larger than ~1/8 of a typical worker's work
+    if num_workers > 0 and total_traversals > 0:
+        per_worker = max(1, total_traversals // num_workers)
+        suggested = min(suggested, max(32, per_worker // 4))
+    return suggested
 
 
 def _select_device(name: str) -> torch.device:
@@ -121,12 +164,14 @@ class DeepCFRTrainer:
             raise ValueError(
                 "traversal_backend must be either 'recursive' or 'vectorized'"
             )
-        if cfg.worker_result_transport not in ("ipc", "file"):
-            raise ValueError("worker_result_transport must be either 'ipc' or 'file'")
+        if cfg.worker_result_transport not in ("ipc", "file", "sharedmem"):
+            raise ValueError("worker_result_transport must be 'ipc', 'file', or 'sharedmem'")
         if cfg.lr_schedule not in ("constant", "cosine", "one_cycle"):
             raise ValueError("lr_schedule must be 'constant', 'cosine', or 'one_cycle'")
         if cfg.use_proxy_nets and cfg.proxy_training_steps <= 0:
             raise ValueError("proxy_training_steps must be positive when proxy nets are enabled")
+        if not (0.0 <= cfg.proxy_distill_strategy_weight <= 1.0):
+            raise ValueError("proxy_distill_strategy_weight must be between 0 and 1")
         self.device = _select_device(cfg.device)
         self.amp_dtype = _select_amp_dtype(cfg.amp_dtype, self.device)
         self.num_actions = ActionSpace(cfg.bet_fractions).num_actions
@@ -177,6 +222,11 @@ class DeepCFRTrainer:
         self._pin_training_batches = bool(cfg.pin_training_batches)
         self._pin_memory_warning_emitted = False
         self._adv_streams = []
+
+        # Pinned batch stager for fast training data movement (Priority 3 optimization)
+        self._batch_stager: Optional[PinnedBatchStager] = make_stager_from_config(
+            cfg, OBS_DIM, self.num_actions, self.device
+        )
         if cfg.concurrent_advantage_training and self.device.type == "cuda":
             self._adv_streams = [torch.cuda.Stream() for _ in range(cfg.num_players)]
 
@@ -253,6 +303,7 @@ class DeepCFRTrainer:
         return base_lr * mult
 
     def _array_to_device(self, array: np.ndarray) -> torch.Tensor:
+        """Legacy path (kept for non-training uses and fallback)."""
         tensor = torch.from_numpy(array)
         non_blocking = False
         if self.device.type == "cuda" and self._pin_training_batches:
@@ -265,6 +316,24 @@ class DeepCFRTrainer:
                     self._pin_memory_warning_emitted = True
                 self._pin_training_batches = False
         return tensor.to(self.device, non_blocking=non_blocking)
+
+    def _stage_training_batch(
+        self,
+        obs_np: np.ndarray,
+        legal_np: np.ndarray,
+        target_np: np.ndarray,
+        weight_np: np.ndarray,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Preferred fast path using the pinned stager when available."""
+        if self._batch_stager is not None:
+            return self._batch_stager.stage(obs_np, legal_np, target_np, weight_np)
+        # Fallback to old path
+        return (
+            self._array_to_device(obs_np),
+            self._array_to_device(legal_np),
+            self._array_to_device(target_np),
+            self._array_to_device(weight_np),
+        )
 
     def _train_net(
         self,
@@ -316,22 +385,20 @@ class DeepCFRTrainer:
         v_target = None
         v_weight = None
         if es_enabled:
-            v_obs_np, v_legal_np, v_target_np, v_weight_np = buffer.sample(es_val_size)
-            v_obs = self._array_to_device(v_obs_np)
-            v_legal = self._array_to_device(v_legal_np)
-            v_target = self._array_to_device(v_target_np)
-            v_weight = self._array_to_device(v_weight_np)
+            v_obs_np, v_legal_np, v_target_np, v_weight_np = buffer.sample(es_val_size, copy=False)
+            v_obs, v_legal, v_target, v_weight = self._stage_training_batch(
+                v_obs_np, v_legal_np, v_target_np, v_weight_np
+            )
             if cfr_plus_clamp:
                 v_target = torch.clamp(v_target, min=0.0)
         for step in range(steps):
             last_lr = self._scheduled_learning_rate(base_lr, step, steps)
             for group in opt.param_groups:
                 group["lr"] = last_lr
-            obs_np, legal_np, target_np, weight_np = buffer.sample(bs)
-            obs = self._array_to_device(obs_np)
-            legal = self._array_to_device(legal_np)
-            target = self._array_to_device(target_np)
-            weight = self._array_to_device(weight_np)
+            obs_np, legal_np, target_np, weight_np = buffer.sample(bs, copy=False)
+            obs, legal, target, weight = self._stage_training_batch(
+                obs_np, legal_np, target_np, weight_np
+            )
             if cfr_plus_clamp:
                 target = torch.clamp(target, min=0.0)
             opt.zero_grad(set_to_none=True)
@@ -492,6 +559,7 @@ class DeepCFRTrainer:
                 amp_dtype=self.amp_dtype,
                 loss_log_interval=self.cfg.loss_log_interval,
                 array_to_device=self._array_to_device,
+                strategy_weight=self.cfg.proxy_distill_strategy_weight,
             )
             self.writer.add_scalar(f"loss/proxy_p{p}", stats["loss"], t)
             self.writer.add_scalar(f"proxy/strategy_l1_p{p}", stats["strategy_l1"], t)
@@ -688,16 +756,32 @@ class DeepCFRTrainer:
 
         total = cfg.traversals_per_iter
         nw = self._pool_workers
-        chunk = _traversal_chunk_size(total, nw, cfg.worker_chunk_min)
-        tasks = []
-        use_file_results = cfg.worker_result_transport == "file"
-        if self._use_vectorized_traversal():
-            worker_fn = (
-                _worker_run_chunk_vectorized_to_file
-                if use_file_results else _worker_run_chunk_vectorized
+        chunk = _traversal_chunk_size(total, nw, cfg.worker_chunk_min, cfg.min_tasks_per_worker)
+        if t % max(1, cfg.log_interval * 5) == 0 or t <= 3:
+            logger.debug(
+                "chunking iter %d | total=%d | workers=%d | chunk=%d | min_tasks_per_worker=%d",
+                t, total, nw, chunk, cfg.min_tasks_per_worker
             )
+        tasks = []
+        transport = cfg.worker_result_transport
+        use_file = transport == "file"
+        use_shared = transport == "sharedmem"
+
+        if self._use_vectorized_traversal():
+            if use_shared:
+                worker_fn = _worker_run_chunk_vectorized_sharedmem
+            elif use_file:
+                worker_fn = _worker_run_chunk_vectorized_to_file
+            else:
+                worker_fn = _worker_run_chunk_vectorized
         else:
-            worker_fn = _worker_run_chunk_to_file if use_file_results else _worker_run_chunk
+            if use_shared:
+                worker_fn = _worker_run_chunk_sharedmem
+            elif use_file:
+                worker_fn = _worker_run_chunk_to_file
+            else:
+                worker_fn = _worker_run_chunk
+
         offset = 0
         button_offset = 0
         while offset < total:
@@ -714,7 +798,7 @@ class DeepCFRTrainer:
                     traverser, sz, t, seed, button_offset, cfg.linear_cfr,
                     cfg.discounted_cfr_alpha, cfg.discounted_cfr_gamma,
                 ]
-            if use_file_results:
+            if use_file:
                 args.append(self._worker_result_dir)
             tasks.append(tuple(args))
             offset += sz
@@ -738,16 +822,32 @@ class DeepCFRTrainer:
             return None
         nw = self._pool_workers
         total = cfg.traversals_per_iter
-        chunk = _traversal_chunk_size(total, nw, cfg.worker_chunk_min)
-        pending = []
-        use_file_results = cfg.worker_result_transport == "file"
-        if self._use_vectorized_traversal():
-            worker_fn = (
-                _worker_run_chunk_vectorized_to_file
-                if use_file_results else _worker_run_chunk_vectorized
+        chunk = _traversal_chunk_size(total, nw, cfg.worker_chunk_min, cfg.min_tasks_per_worker)
+        if t % max(1, cfg.log_interval * 5) == 0 or t <= 3:
+            logger.debug(
+                "chunking (async) iter %d | total=%d | workers=%d | chunk=%d | min_tasks_per_worker=%d",
+                t, total, nw, chunk, cfg.min_tasks_per_worker
             )
+        pending = []
+        transport = cfg.worker_result_transport
+        use_file = transport == "file"
+        use_shared = transport == "sharedmem"
+
+        if self._use_vectorized_traversal():
+            if use_shared:
+                worker_fn = _worker_run_chunk_vectorized_sharedmem
+            elif use_file:
+                worker_fn = _worker_run_chunk_vectorized_to_file
+            else:
+                worker_fn = _worker_run_chunk_vectorized
         else:
-            worker_fn = _worker_run_chunk_to_file if use_file_results else _worker_run_chunk
+            if use_shared:
+                worker_fn = _worker_run_chunk_sharedmem
+            elif use_file:
+                worker_fn = _worker_run_chunk_to_file
+            else:
+                worker_fn = _worker_run_chunk
+
         for p in range(cfg.num_players):
             tasks = []
             offset = 0
@@ -766,7 +866,7 @@ class DeepCFRTrainer:
                         p, sz, t, seed, button_offset, cfg.linear_cfr,
                         cfg.discounted_cfr_alpha, cfg.discounted_cfr_gamma,
                     ]
-                if use_file_results:
+                if use_file:
                     args.append(self._worker_result_dir)
                 tasks.append(tuple(args))
                 offset += sz
@@ -775,26 +875,38 @@ class DeepCFRTrainer:
         return PendingTraversalBatch(t, time.time(), pending)
 
     def _materialize_worker_result(self, result):
-        if not isinstance(result, str):
+        # Direct IPC return (tuple of 8 arrays)
+        if isinstance(result, (list, tuple)) and len(result) == 8 and isinstance(result[0], np.ndarray):
             return result
-        path = result
-        try:
-            with np.load(path) as data:
-                return (
-                    data["a_obs"].copy(),
-                    data["a_legal"].copy(),
-                    data["a_target"].copy(),
-                    data["a_weight"].copy(),
-                    data["s_obs"].copy(),
-                    data["s_legal"].copy(),
-                    data["s_target"].copy(),
-                    data["s_weight"].copy(),
-                )
-        finally:
+
+        # Shared memory transport: (name, size)
+        if isinstance(result, (list, tuple)) and len(result) == 2 and isinstance(result[0], str):
+            name, size = result
+            return load_results_from_sharedmem(name, size)
+
+        # File transport: path string
+        if isinstance(result, str):
+            path = result
             try:
-                os.remove(path)
-            except OSError:
-                pass
+                with np.load(path) as data:
+                    return (
+                        data["a_obs"].copy(),
+                        data["a_legal"].copy(),
+                        data["a_target"].copy(),
+                        data["a_weight"].copy(),
+                        data["s_obs"].copy(),
+                        data["s_legal"].copy(),
+                        data["s_target"].copy(),
+                        data["s_weight"].copy(),
+                    )
+            finally:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+        # Fallback: assume it's already the 8-tuple
+        return result
 
     def _insert_worker_results(
         self,
@@ -831,12 +943,12 @@ class DeepCFRTrainer:
         logger.info(
             "deep_cfr start | iters=%d | traversals/iter/player=%d | players=%d | "
             "start_iter=%d | stack=%d | bb=%d | sizes=%s | obs=%d | actions=%d | "
-            "device=%s | backend=%s | lr=%.4g/%.4g | schedule=%s",
+            "device=%s | backend=%s | workers=%d | chunk_min=%d | min_tasks/w=%d | vbatch=%d | transport=%s",
             cfg.num_iterations, cfg.traversals_per_iter, cfg.num_players,
             self.iter, cfg.starting_stack, cfg.big_blind, cfg.bet_fractions, OBS_DIM,
             self.num_actions, self.device, cfg.traversal_backend,
-            self._base_learning_rate("regression"), self._base_learning_rate("ce_soft"),
-            cfg.lr_schedule,
+            cfg.num_workers, cfg.worker_chunk_min, cfg.min_tasks_per_worker,
+            cfg.vectorized_traversal_batch_size, cfg.worker_result_transport,
         )
         start_iter = int(self.iter)
         if start_iter >= cfg.num_iterations:

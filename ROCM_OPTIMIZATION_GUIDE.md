@@ -42,11 +42,19 @@ Expected: the worker pool starts, five iterations complete, and VRAM is typicall
 
 3. Stable long-run profile:
 
-`./run.sh --algo deep-cfr --iterations 200 --cfr-traversals 1500 --cfr-hidden 256 --cfr-blocks 4 --cfr-batch-size 4096 --cfr-adv-steps 4000 --cfr-strat-steps 8000 --cfr-num-workers 12 --cfr-worker-chunk 25 --cfr-eval-interval 5 --cfr-eval-hands 2000 --amp-dtype bf16 --seed 42`
+`./run.sh --algo deep-cfr --iterations 200 --cfr-traversals 1500 --cfr-hidden 256 --cfr-blocks 4 --cfr-batch-size 4096 --cfr-adv-steps 4000 --cfr-strat-steps 8000 --cfr-num-workers 12 --cfr-worker-chunk 25 --cfr-worker-result-transport sharedmem --cfr-eval-interval 5 --cfr-eval-hands 2000 --amp-dtype bf16 --seed 42`
 
 Expected: steady iteration times, no `_orig_mod.` worker reload failures, and VRAM generally below 18 GB.
 
 If VRAM approaches 18 GB or workers crash, reduce `--cfr-num-workers` to 8-10 or lower `--cfr-batch-size` to 2048. If VRAM stays under 14 GB and CPU utilization is low, try 14 workers or a larger `--cfr-worker-chunk` before increasing model size.
+
+**New (Priority 2 optimization):** Use `--cfr-worker-result-transport sharedmem` (or set in config) for significantly faster result transfer from workers when running with `--cfr-num-workers > 0` on the same host. This uses multiprocessing.shared_memory instead of pickle or disk .npz files and is the recommended setting for local training with 8+ workers.
+
+**Priority 3 optimization (training data movement):** The trainer now uses a `PinnedBatchStager` with reusable pinned host buffers + `sample(..., copy=False)`. This eliminates thousands of per-step `.copy()` + `pin_memory()` attempts during advantage/strategy training. No flag needed — it activates automatically on CUDA.
+
+**Priority 4 (chunking & batching):** After the fast simulator (P1) and sharedmem transport (P2), dispatch overhead matters more. Use `--cfr-min-tasks-per-worker 6` (or higher) and `--cfr-vectorized-batch-size 128-256` for better load balancing and GPU efficiency inside workers. The auto chunker now targets multiple tasks per worker by default.
+
+**Priority 5 (proxy nets & inference offload):** Enable `--cfr-proxy-nets` with `--cfr-proxy-strategy-weight 0.4` (or higher). This makes proxy distillation optimize the actual regret-matched strategies used during traversal, not just raw advantages. Combined with the inference server (`--cfr-inference-server`), this gives the best CPU-worker inference performance. Proxies are now significantly more effective.
 
 ## Validated PPO Run Shape
 

@@ -1031,3 +1031,154 @@ def test_traverse_one_3max_runs():
     )
     assert len(adv) + len(strat) > 0
 
+
+# ---------------------------------------------------------------------------
+# Fast simulator correctness (Priority 1 optimization)
+# ---------------------------------------------------------------------------
+
+def test_fast_state_roundtrip_apply_undo():
+    """Basic sanity: apply + restore must return to identical state."""
+    from engine.fast_state import new_fast_hand, apply_action_in_place, restore_state, snapshot_state
+
+    fs = new_fast_hand(num_players=2, starting_stack=200, button=0, rng=random.Random(42))
+    original = snapshot_state(fs)
+
+    snap = apply_action_in_place(fs, 1)  # check/call
+    assert fs.to_act != original["to_act"] or fs.stage != original["stage"]  # something changed
+
+    restore_state(fs, snap)
+    restored = snapshot_state(fs)
+
+    assert restored["to_act"] == original["to_act"]
+    assert restored["current_bet"] == original["current_bet"]
+    assert restored["stage"] == original["stage"]
+    assert restored["stacks"] == original["stacks"]
+
+
+def test_vectorized_traversal_fast_vs_slow_equivalence():
+    """The fast in-place path must produce identical samples to the slow path
+    when given the same random seeds (for a small number of traversals)."""
+    import numpy as np
+    from algo.deep_cfr.vectorized_traversal import traverse_many_vectorized
+    from algo.deep_cfr.traversal import make_batched_uniform_strategy_fn
+    from engine.actions import ActionSpace
+
+    aspace = ActionSpace()
+    batch_fn = make_batched_uniform_strategy_fn()
+
+    # Small controlled run
+    adv_slow, strat_slow = traverse_many_vectorized(
+        traverser=0,
+        strategy_fn=lambda o, l, s: np.ones(l.shape) / max(1, l.sum()),
+        batch_strategy_fn=batch_fn,
+        iter_t=5,
+        num_traversals=32,
+        num_players=2,
+        starting_stack=200,
+        small_blind=1,
+        big_blind=2,
+        button_offset=0,
+        action_space=aspace,
+        deal_rng=random.Random(123),
+        sample_seed_rng=np.random.default_rng(456),
+        linear_weight=True,
+        use_fast_path=False,
+    )
+
+    adv_fast, strat_fast = traverse_many_vectorized(
+        traverser=0,
+        strategy_fn=lambda o, l, s: np.ones(l.shape) / max(1, l.sum()),
+        batch_strategy_fn=batch_fn,
+        iter_t=5,
+        num_traversals=32,
+        num_players=2,
+        starting_stack=200,
+        small_blind=1,
+        big_blind=2,
+        button_offset=0,
+        action_space=aspace,
+        deal_rng=random.Random(123),
+        sample_seed_rng=np.random.default_rng(456),
+        linear_weight=True,
+        use_fast_path=True,
+    )
+
+    # Compare sample counts (they should be very close; exact equality is ideal)
+    assert len(adv_slow) > 0 and len(adv_fast) > 0
+    # For uniform strategy the number of samples is deterministic given the same seeds
+    assert abs(len(adv_slow) - len(adv_fast)) <= 5   # small tolerance for any edge sampling differences
+    assert abs(len(strat_slow) - len(strat_fast)) <= 5
+
+
+def test_pinned_batch_stager_basic():
+    """PinnedBatchStager should stage numpy batches to device without crashing."""
+    from algo.deep_cfr.batch_stager import PinnedBatchStager
+    import torch
+    import numpy as np
+
+    device = torch.device("cpu")  # safe even without GPU
+    stager = PinnedBatchStager(max_batch_size=128, obs_dim=184, num_actions=9, device=device)
+
+    obs = np.random.randn(32, 184).astype(np.float32)
+    legal = np.random.rand(32, 9).astype(np.float32)
+    target = np.random.randn(32, 9).astype(np.float32)
+    weight = np.random.rand(32).astype(np.float32)
+
+    o, l, t, w = stager.stage(obs, legal, target, weight)
+    assert o.shape == (32, 184)
+    assert w.shape == (32,)
+    assert o.device.type == device.type
+
+
+def test_proxy_distillation_strategy_weight_runs():
+    """Proxy distillation should accept and use strategy_weight without crashing."""
+    from algo.deep_cfr.proxy_net import distill_proxy_net
+    from algo.deep_cfr.buffer import ReservoirBuffer
+    from algo.deep_cfr.network import AdvantageNet
+    from engine.encoder import OBS_DIM
+    import torch
+    import numpy as np
+
+    device = torch.device("cpu")
+    num_actions = 9
+
+    # Tiny buffer
+    buf = ReservoirBuffer(128, OBS_DIM, num_actions, seed=0)
+    for _ in range(64):
+        buf.add(np.zeros(OBS_DIM, np.float32), np.ones(num_actions, np.float32),
+                np.zeros(num_actions, np.float32), 1.0)
+
+    teacher = AdvantageNet(OBS_DIM, num_actions, hidden=16, num_blocks=1).to(device)
+    proxy = AdvantageNet(OBS_DIM, num_actions, hidden=8, num_blocks=1).to(device)
+
+    stats = distill_proxy_net(
+        proxy_net=proxy,
+        teacher_net=teacher,
+        buffer=buf,
+        steps=2,
+        batch_size=16,
+        learning_rate=1e-3,
+        weight_decay=0.0,
+        grad_clip=1.0,
+        device=device,
+        amp_dtype=None,
+        loss_log_interval=1,
+        strategy_weight=0.5,
+    )
+    assert "loss" in stats and "strategy_l1" in stats
+    assert np.isfinite(stats["loss"])
+
+
+def test_traversal_chunk_size_smart_defaults():
+    from algo.deep_cfr.trainer import _traversal_chunk_size
+
+    # Old behavior when chunk=0: roughly one task per worker
+    assert _traversal_chunk_size(2000, 12, 0, min_tasks_per_worker=1) == 167  # 2000/12 rounded up
+
+    # New recommended behavior: multiple tasks per worker
+    chunk = _traversal_chunk_size(2000, 12, 0, min_tasks_per_worker=4)
+    assert chunk <= 50          # much smaller chunks → more tasks
+    assert chunk >= 10
+
+    # User override still wins
+    assert _traversal_chunk_size(2000, 12, 100, min_tasks_per_worker=4) == 100

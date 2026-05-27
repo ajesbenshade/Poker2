@@ -166,7 +166,9 @@ def parse_args():
     parser.add_argument("--cfr-num-workers", dest="cfr_num_workers", type=int, default=None,
                         help="Worker processes for parallel CFR traversals (0=serial)")
     parser.add_argument("--cfr-worker-chunk", dest="cfr_worker_chunk", type=int, default=None,
-                        help="Target traversals per worker task (0=auto one task per worker)")
+                        help="Target traversals per worker task (0=auto)")
+    parser.add_argument("--cfr-min-tasks-per-worker", dest="cfr_min_tasks_per_worker", type=int, default=None,
+                        help="When auto-chunking, target at least this many tasks per worker for load balancing (default 4)")
     parser.add_argument("--cfr-compile", dest="cfr_compile", action="store_true",
                         help="Apply torch.compile to GPU train nets")
     parser.add_argument("--cfr-async", dest="cfr_async", action="store_true",
@@ -188,10 +190,10 @@ def parse_args():
                         help="Deep CFR traversal backend")
     parser.add_argument("--cfr-vectorized-batch-size", dest="cfr_vectorized_batch_size",
                         type=int, default=None,
-                        help="Hands per vectorized traversal batch")
+                        help="Hands per vectorized traversal batch (larger values often better after fast simulator)")
     parser.add_argument("--cfr-worker-result-transport", dest="cfr_worker_result_transport",
-                        choices=("ipc", "file"), default=None,
-                        help="How Deep CFR workers return traversal samples")
+                        choices=("ipc", "file", "sharedmem"), default=None,
+                        help="How Deep CFR workers return traversal samples (sharedmem = fastest zero-copy on same host)")
     parser.add_argument("--cfr-proxy-nets", dest="cfr_proxy_nets", action="store_true",
                         help="Use smaller distilled advantage nets for traversal workers")
     parser.add_argument("--cfr-proxy-hidden", dest="cfr_proxy_hidden", type=int, default=None,
@@ -202,6 +204,8 @@ def parse_args():
                         help="Refresh proxy nets every N CFR iterations")
     parser.add_argument("--cfr-proxy-steps", dest="cfr_proxy_steps", type=int, default=None,
                         help="Distillation steps per proxy refresh")
+    parser.add_argument("--cfr-proxy-strategy-weight", dest="cfr_proxy_strategy_weight", type=float, default=None,
+                        help="Weight on strategy matching loss during proxy distillation (0-1, higher = better traversal behavior)")
     parser.add_argument("--cfr-dcfr-alpha", dest="cfr_dcfr_alpha", type=float, default=None,
                         help="DCFR exponent for advantage sample weights (default 1.0=linear CFR)")
     parser.add_argument("--cfr-dcfr-gamma", dest="cfr_dcfr_gamma", type=float, default=None,
@@ -727,6 +731,8 @@ def train_deep_cfr(args):
         cfg.num_workers = int(args.cfr_num_workers)
     if args.cfr_worker_chunk is not None:
         cfg.worker_chunk_min = int(args.cfr_worker_chunk)
+    if args.cfr_min_tasks_per_worker is not None:
+        cfg.min_tasks_per_worker = max(1, int(args.cfr_min_tasks_per_worker))
     if args.cfr_compile:
         cfg.use_torch_compile = True
     if args.cfr_async:
@@ -759,6 +765,8 @@ def train_deep_cfr(args):
         cfg.proxy_refresh_interval = max(1, int(args.cfr_proxy_refresh))
     if args.cfr_proxy_steps is not None:
         cfg.proxy_training_steps = max(1, int(args.cfr_proxy_steps))
+    if args.cfr_proxy_strategy_weight is not None:
+        cfg.proxy_distill_strategy_weight = float(max(0.0, min(1.0, args.cfr_proxy_strategy_weight)))
     if args.cfr_dcfr_alpha is not None:
         cfg.discounted_cfr_alpha = float(args.cfr_dcfr_alpha)
     if args.cfr_dcfr_gamma is not None:

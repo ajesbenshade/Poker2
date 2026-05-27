@@ -140,17 +140,34 @@ class ReservoirBuffer:
                     self._weight[dst_idx] = weights[src_idx]
             self._seen += n
 
-    def sample(self, batch_size: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def sample(
+        self, batch_size: int, copy: bool = True
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Sample a batch from the reservoir.
+
+        When copy=False the caller promises to consume the data immediately
+        (e.g. by staging it into pinned memory). Use with care — the returned
+        arrays are views into the internal buffer.
+        """
         with self._lock:
             if self._size == 0:
                 raise RuntimeError("buffer is empty")
             idx = self._rng.integers(0, self._size, size=batch_size)
-            return (
-                self._obs[idx].copy(),
-                self._legal[idx].copy(),
-                self._target[idx].copy(),
-                self._weight[idx].copy(),
-            )
+            if copy:
+                return (
+                    self._obs[idx].copy(),
+                    self._legal[idx].copy(),
+                    self._target[idx].copy(),
+                    self._weight[idx].copy(),
+                )
+            else:
+                # Return views — caller must not hold references across buffer mutations
+                return (
+                    self._obs[idx],
+                    self._legal[idx],
+                    self._target[idx],
+                    self._weight[idx],
+                )
 
     def clear(self) -> None:
         with self._lock:
