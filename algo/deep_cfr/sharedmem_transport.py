@@ -5,10 +5,10 @@ arrays from traversal workers back to the main trainer process.
 
 Usage:
 - Workers allocate a SharedMemory block, write the 8 arrays into it
-  (with a small header describing shapes/dtypes), and return a small
-  descriptor (name + size).
-- Trainer maps the same SharedMemory, reconstructs the arrays (zero-copy
-  views where possible), inserts into buffers, then unlinks the block.
+    (with a small header describing shapes/dtypes), and return a small
+    descriptor (name + size).
+- Trainer maps the same SharedMemory, copies the arrays into process-local
+    numpy arrays, inserts into buffers, then unlinks the block.
 
 This is dramatically faster than pickle (current "ipc") or disk+npz ("file")
 for the large observation/advantage/strategy sample payloads.
@@ -112,14 +112,9 @@ def pack_results_to_sharedmem(
 
 
 def load_results_from_sharedmem(name: str, size: int) -> Tuple[np.ndarray, ...]:
-    """Attach to existing shared memory and return the 8 arrays as views.
-
-    Important: the returned arrays are backed by the shared memory.
-    Caller must keep the SharedMemory object alive until they are done
-    with the data (or copy out). After use, call .unlink() on a new
-    SharedMemory(name) to release the OS resource.
-    """
+    """Attach to existing shared memory, copy out the 8 arrays, and unlink it."""
     shm_obj = shm.SharedMemory(name=name, create=False, size=size)
+    buf = None
     try:
         buf = shm_obj.buf
         header = bytes(buf[:_HEADER_SIZE])
@@ -128,13 +123,16 @@ def load_results_from_sharedmem(name: str, size: int) -> Tuple[np.ndarray, ...]:
         offset = _HEADER_SIZE
         arrays = []
         for shape, dtype in meta:
-            nbytes = int(np.prod(shape) * np.dtype(dtype).itemsize)
-            arr = np.frombuffer(buf[offset : offset + nbytes], dtype=dtype).reshape(shape)
-            arrays.append(arr.copy())  # safe copy out so we can release shm quickly
-            offset += nbytes
+            dtype = np.dtype(dtype)
+            view = np.ndarray(shape, dtype=dtype, buffer=buf, offset=offset)
+            arrays.append(view.copy())
+            offset += view.nbytes
+            del view
 
         return tuple(arrays)
     finally:
+        if buf is not None:
+            buf.release()
         shm_obj.close()
         # Unlink so the OS can free the memory once all attachments are gone.
         try:

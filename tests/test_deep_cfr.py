@@ -29,6 +29,7 @@ from algo.deep_cfr.traversal import (
 from algo.deep_cfr.vectorized_traversal import _traverse_batch, traverse_many_vectorized
 from algo.deep_cfr.worker import _finalize_worker_net, _strip_compile_prefix, serialize_state_dict
 from algo.deep_cfr.trainer import _traversal_chunk_size
+from algo.deep_cfr.sharedmem_transport import load_results_from_sharedmem, pack_results_to_sharedmem
 from engine import OBS_DIM, NUM_ACTIONS
 from engine import new_hand
 from engine.actions import ActionSpace
@@ -173,6 +174,31 @@ def test_traversal_chunk_size_balances_worker_tasks():
     assert _traversal_chunk_size(total=2000, num_workers=12, configured_chunk=25) == 25
     assert _traversal_chunk_size(total=2000, num_workers=12, configured_chunk=0) == 167
     assert _traversal_chunk_size(total=10, num_workers=12, configured_chunk=25) == 10
+
+
+def test_sharedmem_transport_copies_and_unlinks_results():
+    rng = np.random.default_rng(123)
+    result = (
+        rng.standard_normal((5, OBS_DIM)).astype(np.float32),
+        rng.integers(0, 2, size=(5, NUM_ACTIONS)).astype(np.float32),
+        rng.standard_normal((5, NUM_ACTIONS)).astype(np.float32),
+        rng.random(5, dtype=np.float32),
+        rng.standard_normal((7, OBS_DIM)).astype(np.float32),
+        rng.integers(0, 2, size=(7, NUM_ACTIONS)).astype(np.float32),
+        rng.random((7, NUM_ACTIONS), dtype=np.float32),
+        rng.random(7, dtype=np.float32),
+    )
+
+    name, size = pack_results_to_sharedmem(result)
+    loaded = load_results_from_sharedmem(name, size)
+
+    for expected, actual in zip(result, loaded):
+        np.testing.assert_array_equal(actual, expected)
+        assert actual.flags.owndata
+
+    import multiprocessing.shared_memory as shm
+    with pytest.raises(FileNotFoundError):
+        shm.SharedMemory(name=name, create=False)
 
 
 def test_batched_advantage_inference_matches_single_strategy_fn():
