@@ -71,6 +71,9 @@ class DeepCFRConfig:
     eval_interval: int = 5
     eval_hands: int = 2000
     eval_include_human_like: bool = False
+    policy_temperature: float = 1.0
+    policy_bet_multiplier: float = 1.0
+    policy_all_in_multiplier: float = 1.0
 
     # LBR exploitability eval (Phase G)
     lbr_interval: int = 0              # 0 disables; otherwise compute LBR every N iters

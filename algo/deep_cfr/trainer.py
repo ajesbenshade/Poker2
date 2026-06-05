@@ -114,6 +114,28 @@ def _safety_score(eval_payload: Dict[str, float], lbr_mbbg: Optional[float]) -> 
     return float(min(list(eval_payload.values()) + [-float(lbr_mbbg)]))
 
 
+def _policy_eval_meta(cfg: DeepCFRConfig) -> Dict[str, float | bool]:
+    return {
+        "eval_include_human_like": bool(cfg.eval_include_human_like),
+        "policy_temperature": float(cfg.policy_temperature),
+        "policy_bet_multiplier": float(cfg.policy_bet_multiplier),
+        "policy_all_in_multiplier": float(cfg.policy_all_in_multiplier),
+    }
+
+
+def _policy_eval_meta_matches(meta: Dict[str, object], cfg: DeepCFRConfig) -> bool:
+    if bool(meta.get("eval_include_human_like", False)) != bool(cfg.eval_include_human_like):
+        return False
+    for key, expected in (
+        ("policy_temperature", cfg.policy_temperature),
+        ("policy_bet_multiplier", cfg.policy_bet_multiplier),
+        ("policy_all_in_multiplier", cfg.policy_all_in_multiplier),
+    ):
+        if abs(float(meta.get(key, 1.0)) - float(expected)) > 1e-12:
+            return False
+    return True
+
+
 def _effective_vectorized_batch_size(
     requested: int,
     total_traversals: int,
@@ -1065,7 +1087,7 @@ class DeepCFRTrainer:
                     self._best_score = score
                     self.save_checkpoint(os.path.join(cfg.checkpoint_dir, "best.pt"),
                                          meta={"iter": t, "score_mbbg": score,
-                                               "eval_include_human_like": cfg.eval_include_human_like,
+                                               **_policy_eval_meta(cfg),
                                                "eval": eval_payload})
 
             latest_interval = max(1, int(cfg.latest_checkpoint_interval))
@@ -1088,7 +1110,8 @@ class DeepCFRTrainer:
                     self._best_lbr = float(lbr_mbbg)
                     self.save_checkpoint(
                         os.path.join(cfg.checkpoint_dir, "best_lbr.pt"),
-                        meta={"iter": t, "lbr_mbbg": float(lbr_mbbg)},
+                        meta={"iter": t, "lbr_mbbg": float(lbr_mbbg),
+                              **_policy_eval_meta(cfg)},
                     )
                 safety_score = _safety_score(eval_payload, lbr_mbbg)
                 if safety_score is not None:
@@ -1101,7 +1124,7 @@ class DeepCFRTrainer:
                                 "iter": t,
                                 "safety_score_mbbg": safety_score,
                                 "lbr_mbbg": float(lbr_mbbg),
-                                "eval_include_human_like": cfg.eval_include_human_like,
+                                **_policy_eval_meta(cfg),
                                 "eval": eval_payload,
                             },
                         )
@@ -1198,17 +1221,11 @@ class DeepCFRTrainer:
             self.iter = 0
 
         meta = payload.get("meta", {}) or {}
-        if (
-            "score_mbbg" in meta
-            and bool(meta.get("eval_include_human_like", False)) == bool(self.cfg.eval_include_human_like)
-        ):
+        if "score_mbbg" in meta and _policy_eval_meta_matches(meta, self.cfg):
             self._best_score = float(meta["score_mbbg"])
-        if "lbr_mbbg" in meta:
+        if "lbr_mbbg" in meta and _policy_eval_meta_matches(meta, self.cfg):
             self._best_lbr = float(meta["lbr_mbbg"])
-        if (
-            "safety_score_mbbg" in meta
-            and bool(meta.get("eval_include_human_like", False)) == bool(self.cfg.eval_include_human_like)
-        ):
+        if "safety_score_mbbg" in meta and _policy_eval_meta_matches(meta, self.cfg):
             self._best_safety_score = float(meta["safety_score_mbbg"])
         logger.info(
             "loaded Deep CFR checkpoint %s | iter=%d | restore_iteration=%s | buffers=%s",

@@ -28,7 +28,7 @@ from algo.deep_cfr.traversal import (
 )
 from algo.deep_cfr.vectorized_traversal import _traverse_batch, traverse_many_vectorized
 from algo.deep_cfr.worker import _finalize_worker_net, _strip_compile_prefix, serialize_state_dict
-from algo.deep_cfr.trainer import _safety_score, _traversal_chunk_size
+from algo.deep_cfr.trainer import _policy_eval_meta, _policy_eval_meta_matches, _safety_score, _traversal_chunk_size
 from algo.deep_cfr.sharedmem_transport import load_results_from_sharedmem, pack_results_to_sharedmem
 from engine import OBS_DIM, NUM_ACTIONS
 from engine import new_hand
@@ -187,6 +187,17 @@ def test_safety_score_uses_worst_margin_and_negative_lbr():
     assert _safety_score(eval_payload, 2500.0) == -3500.0
     assert _safety_score(eval_payload, None) is None
     assert _safety_score({}, 1000.0) is None
+
+
+def test_policy_eval_meta_requires_matching_transform():
+    cfg = DeepCFRConfig()
+    cfg.eval_include_human_like = True
+    cfg.policy_all_in_multiplier = 0.1
+    meta = _policy_eval_meta(cfg)
+
+    assert _policy_eval_meta_matches(meta, cfg)
+    cfg.policy_all_in_multiplier = 1.0
+    assert not _policy_eval_meta_matches(meta, cfg)
 
 
 def test_sharedmem_transport_copies_and_unlinks_results():
@@ -1011,6 +1022,38 @@ def test_lbr_runs_and_returns_finite_mbbg():
         rng=random.Random(0),
     )
     assert np.isfinite(mbbg)
+
+
+def test_policy_action_multipliers_can_suppress_all_in():
+    from algo.deep_cfr.eval import policy_from_net
+
+    cfg = DeepCFRConfig()
+    aspace = ActionSpace(cfg.bet_fractions)
+
+    class AllInNet(torch.nn.Module):
+        def forward(self, obs, legal):
+            logits = torch.full((obs.shape[0], aspace.num_actions), -5.0)
+            logits[:, aspace.check_call_id] = 0.0
+            logits[:, aspace.all_in_id] = 6.0
+            return logits
+
+    state = new_hand(
+        num_players=2,
+        starting_stack=cfg.starting_stack,
+        small_blind=cfg.small_blind,
+        big_blind=cfg.big_blind,
+        button=0,
+        rng=random.Random(0),
+        action_space=aspace,
+    )
+    raw = policy_from_net(AllInNet(), torch.device("cpu"), deterministic=True, action_space=aspace)
+    damped = policy_from_net(
+        AllInNet(), torch.device("cpu"), deterministic=True,
+        action_space=aspace, all_in_multiplier=0.0,
+    )
+
+    assert raw(state, state.to_act, random.Random(0)) == aspace.all_in_id
+    assert damped(state, state.to_act, random.Random(0)) != aspace.all_in_id
 
 
 # ---------------------------------------------------------------------------

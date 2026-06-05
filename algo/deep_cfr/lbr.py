@@ -120,7 +120,15 @@ def evaluate_lbr(
     if rng is None:
         rng = random.Random(0xCAFE)
     space = ActionSpace(cfg.bet_fractions)
-    trained = policy_from_net(net, device, deterministic=False)
+    trained = policy_from_net(
+        net,
+        device,
+        deterministic=False,
+        action_space=space,
+        temperature=cfg.policy_temperature,
+        bet_multiplier=cfg.policy_bet_multiplier,
+        all_in_multiplier=cfg.policy_all_in_multiplier,
+    )
 
     def _play(lbr_seat: int, hand_i: int) -> float:
         button = hand_i % 2

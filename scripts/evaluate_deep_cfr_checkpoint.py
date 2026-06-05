@@ -63,6 +63,12 @@ def _mean_std(values: list[float]) -> tuple[float, float]:
 
 def evaluate_checkpoint(args, path: Path) -> None:
     payload, cfg, device, net = _load_policy(path, args.device)
+    if args.policy_temperature is not None:
+        cfg.policy_temperature = max(1e-6, float(args.policy_temperature))
+    if args.policy_bet_mult is not None:
+        cfg.policy_bet_multiplier = max(0.0, float(args.policy_bet_mult))
+    if args.policy_all_in_mult is not None:
+        cfg.policy_all_in_multiplier = max(0.0, float(args.policy_all_in_mult))
     seeds = _parse_seeds(args.seeds)
     metrics: dict[str, list[float]] = {}
 
@@ -91,6 +97,11 @@ def evaluate_checkpoint(args, path: Path) -> None:
     meta = payload.get("meta", {}) or {}
     print(f"CHECKPOINT {path}")
     print(f"  iter={payload.get('iter')} meta={meta}")
+    print(
+        "  policy_transform="
+        f"temp={cfg.policy_temperature:g} bet_mult={cfg.policy_bet_multiplier:g} "
+        f"all_in_mult={cfg.policy_all_in_multiplier:g}"
+    )
     for key in sorted(metrics):
         mean, std = _mean_std(metrics[key])
         print(f"  {key}: mean={mean:+.1f} std={std:.1f} n={len(metrics[key])}")
@@ -106,6 +117,9 @@ def main() -> None:
     parser.add_argument("--seeds", type=str, default="4242")
     parser.add_argument("--device", choices=("cpu", "cuda"), default=None)
     parser.add_argument("--include-human-like", action="store_true")
+    parser.add_argument("--policy-temperature", type=float, default=None)
+    parser.add_argument("--policy-bet-mult", type=float, default=None)
+    parser.add_argument("--policy-all-in-mult", type=float, default=None)
     args = parser.parse_args()
 
     for path in args.checkpoints:

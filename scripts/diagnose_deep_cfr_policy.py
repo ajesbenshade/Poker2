@@ -40,7 +40,15 @@ def _bucket_action(space: ActionSpace, action: int) -> str:
 def _play_one_orientation(net, cfg, device, baseline, trained_seat: int, hands: int, seed: int) -> dict:
     rng = random.Random(seed)
     space = ActionSpace(cfg.bet_fractions)
-    trained = policy_from_net(net, device, deterministic=False)
+    trained = policy_from_net(
+        net,
+        device,
+        deterministic=False,
+        action_space=space,
+        temperature=cfg.policy_temperature,
+        bet_multiplier=cfg.policy_bet_multiplier,
+        all_in_multiplier=cfg.policy_all_in_multiplier,
+    )
     policies = [baseline] * cfg.num_players
     policies[trained_seat] = trained
 
@@ -192,9 +200,18 @@ def main() -> None:
     parser.add_argument("--seeds", type=str, default="4242")
     parser.add_argument("--baselines", type=str, default="bluff_catcher,pot_pressure,loose_passive")
     parser.add_argument("--device", choices=("cpu", "cuda"), default=None)
+    parser.add_argument("--policy-temperature", type=float, default=None)
+    parser.add_argument("--policy-bet-mult", type=float, default=None)
+    parser.add_argument("--policy-all-in-mult", type=float, default=None)
     args = parser.parse_args()
 
     payload, cfg, device, net = _load_policy(args.checkpoint, args.device)
+    if args.policy_temperature is not None:
+        cfg.policy_temperature = max(1e-6, float(args.policy_temperature))
+    if args.policy_bet_mult is not None:
+        cfg.policy_bet_multiplier = max(0.0, float(args.policy_bet_mult))
+    if args.policy_all_in_mult is not None:
+        cfg.policy_all_in_multiplier = max(0.0, float(args.policy_all_in_mult))
     baseline_pool = dict(BASELINES)
     baseline_pool.update(HUMAN_LIKE_BASELINES)
     names = _parse_names(args.baselines)
@@ -202,6 +219,11 @@ def main() -> None:
 
     print(f"CHECKPOINT {args.checkpoint}")
     print(f"  iter={payload.get('iter')} meta={payload.get('meta', {})}")
+    print(
+        "  policy_transform="
+        f"temp={cfg.policy_temperature:g} bet_mult={cfg.policy_bet_multiplier:g} "
+        f"all_in_mult={cfg.policy_all_in_multiplier:g}"
+    )
     print(f"  hands_per_seed={args.hands} seeds={seeds} baselines={names}")
 
     summary_scores: dict[str, list[float]] = defaultdict(list)

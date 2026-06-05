@@ -172,14 +172,33 @@ def policy_from_net(
     net: PolicyNet,
     device: torch.device,
     deterministic: bool = False,
+    *,
+    action_space: Optional[ActionSpace] = None,
+    temperature: float = 1.0,
+    bet_multiplier: float = 1.0,
+    all_in_multiplier: float = 1.0,
 ) -> Policy:
+    action_space = action_space or ActionSpace()
+    temperature = max(1e-6, float(temperature))
+    bet_multiplier = max(0.0, float(bet_multiplier))
+    all_in_multiplier = max(0.0, float(all_in_multiplier))
+
     @torch.no_grad()
     def _act(state: GameState, seat: int, rng: random.Random) -> int:
         legal = np.asarray(legal_action_mask(state), dtype=np.float32)
         obs = encode_observation(state, perspective_seat=seat)
         obs_t = torch.from_numpy(obs).to(device).unsqueeze(0)
         legal_t = torch.from_numpy(legal).to(device).unsqueeze(0)
-        probs = net.strategy(obs_t, legal_t).squeeze(0).float().cpu().numpy()
+        logits = net(obs_t, legal_t) / temperature
+        masked = logits.masked_fill(legal_t < 0.5, float("-inf"))
+        probs = torch.softmax(masked, dim=-1).squeeze(0).float().cpu().numpy()
+        probs = np.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+        if bet_multiplier != 1.0 or all_in_multiplier != 1.0:
+            for action in range(len(probs)):
+                if action_space.is_bet(action):
+                    probs[action] *= bet_multiplier
+            if 0 <= action_space.all_in_id < len(probs):
+                probs[action_space.all_in_id] *= all_in_multiplier
         legal_idx = [i for i, m in enumerate(legal) if m > 0.5]
         if not legal_idx:
             raise RuntimeError("no legal actions")
@@ -273,7 +292,16 @@ def evaluate_vs_baselines(
     n = num_hands or cfg.eval_hands
     bb = cfg.big_blind
     rng = rng or random.Random(0xBEEF)
-    trained = policy_from_net(net, device, deterministic=False)
+    action_space = ActionSpace(cfg.bet_fractions)
+    trained = policy_from_net(
+        net,
+        device,
+        deterministic=False,
+        action_space=action_space,
+        temperature=cfg.policy_temperature,
+        bet_multiplier=cfg.policy_bet_multiplier,
+        all_in_multiplier=cfg.policy_all_in_multiplier,
+    )
     np_ = cfg.num_players
     results: Dict[str, float] = {}
     chosen_baselines = dict(BASELINES if baselines is None else baselines)
