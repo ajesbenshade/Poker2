@@ -142,6 +142,8 @@ def parse_args():
                         help="Hands per baseline match in Deep CFR eval")
     parser.add_argument("--cfr-eval-interval", dest="cfr_eval_interval", type=int, default=None,
                         help="CFR iterations between baseline evals")
+    parser.add_argument("--cfr-eval-human-like", dest="cfr_eval_human_like", action="store_true",
+                        help="Include human-like scripted opponents in Deep CFR periodic eval and best.pt scoring")
     parser.add_argument("--cfr-stack", dest="cfr_stack", type=int, default=None,
                         help="Starting stack in chips (BB units = stack / big_blind)")
     parser.add_argument("--cfr-adv-steps", dest="cfr_adv_steps", type=int, default=None)
@@ -701,6 +703,8 @@ def train_deep_cfr(args):
         cfg.eval_hands = int(args.cfr_eval_hands)
     if args.cfr_eval_interval is not None:
         cfg.eval_interval = int(args.cfr_eval_interval)
+    if args.cfr_eval_human_like:
+        cfg.eval_include_human_like = True
     if args.cfr_stack is not None:
         cfg.starting_stack = int(args.cfr_stack)
     if args.cfr_adv_steps is not None:
@@ -830,7 +834,7 @@ def train_deep_cfr(args):
     logger.info(
         "DEEP CFR | players=%d | iters=%d | traversals/iter/p=%d | hidden=%d | blocks=%d | "
         "stack=%d (%d BB) | adv_steps=%d | strat_steps=%d | bs=%d | lr=%.4g/%.4g | "
-        "schedule=%s | eval_every=%d (%d hands) | backend=%s | proxy=%s | seed=%d",
+        "schedule=%s | eval_every=%d (%d hands, human=%s) | backend=%s | proxy=%s | seed=%d",
         cfg.num_players, cfg.num_iterations, cfg.traversals_per_iter,
         cfg.hidden_size, cfg.num_blocks, cfg.starting_stack,
         cfg.starting_stack // cfg.big_blind, cfg.advantage_train_steps,
@@ -838,7 +842,7 @@ def train_deep_cfr(args):
         cfg.advantage_learning_rate if cfg.advantage_learning_rate is not None else cfg.learning_rate,
         cfg.strategy_learning_rate if cfg.strategy_learning_rate is not None else cfg.learning_rate,
         cfg.lr_schedule,
-        cfg.eval_interval, cfg.eval_hands, cfg.traversal_backend,
+        cfg.eval_interval, cfg.eval_hands, int(cfg.eval_include_human_like), cfg.traversal_backend,
         int(cfg.use_proxy_nets), cfg.seed,
     )
     trainer = DeepCFRTrainer(cfg)

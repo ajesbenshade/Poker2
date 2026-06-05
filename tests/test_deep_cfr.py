@@ -28,7 +28,7 @@ from algo.deep_cfr.traversal import (
 )
 from algo.deep_cfr.vectorized_traversal import _traverse_batch, traverse_many_vectorized
 from algo.deep_cfr.worker import _finalize_worker_net, _strip_compile_prefix, serialize_state_dict
-from algo.deep_cfr.trainer import _traversal_chunk_size
+from algo.deep_cfr.trainer import _safety_score, _traversal_chunk_size
 from algo.deep_cfr.sharedmem_transport import load_results_from_sharedmem, pack_results_to_sharedmem
 from engine import OBS_DIM, NUM_ACTIONS
 from engine import new_hand
@@ -174,6 +174,19 @@ def test_traversal_chunk_size_balances_worker_tasks():
     assert _traversal_chunk_size(total=2000, num_workers=12, configured_chunk=25) == 25
     assert _traversal_chunk_size(total=2000, num_workers=12, configured_chunk=0) == 167
     assert _traversal_chunk_size(total=10, num_workers=12, configured_chunk=25) == 10
+
+
+def test_safety_score_uses_worst_margin_and_negative_lbr():
+    eval_payload = {
+        "random": 1800.0,
+        "tight_aggressive": 120.0,
+        "bluff_catcher": -3500.0,
+    }
+
+    assert _safety_score(eval_payload, 4200.0) == -4200.0
+    assert _safety_score(eval_payload, 2500.0) == -3500.0
+    assert _safety_score(eval_payload, None) is None
+    assert _safety_score({}, 1000.0) is None
 
 
 def test_sharedmem_transport_copies_and_unlinks_results():

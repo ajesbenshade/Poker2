@@ -108,6 +108,12 @@ def _traversal_chunk_size(
     return min(total, ideal_chunk)
 
 
+def _safety_score(eval_payload: Dict[str, float], lbr_mbbg: Optional[float]) -> Optional[float]:
+    if not eval_payload or lbr_mbbg is None:
+        return None
+    return float(min(list(eval_payload.values()) + [-float(lbr_mbbg)]))
+
+
 def _effective_vectorized_batch_size(
     requested: int,
     total_traversals: int,
@@ -219,6 +225,7 @@ class DeepCFRTrainer:
         self.iter = 0
         self._best_score = -float("inf")
         self._best_lbr = float("inf")
+        self._best_safety_score = -float("inf")
         self._pin_training_batches = bool(cfg.pin_training_batches)
         self._pin_memory_warning_emitted = False
         self._adv_streams = []
@@ -1044,6 +1051,7 @@ class DeepCFRTrainer:
                     self.policy_net, cfg, self.device,
                     num_hands=cfg.eval_hands,
                     rng=random.Random(cfg.seed + 9000 + t),
+                    include_human_like=cfg.eval_include_human_like,
                 )
                 for name, mbbg in eval_payload.items():
                     self.writer.add_scalar(f"eval/mbb_per_game/{name}", mbbg, t)
@@ -1057,6 +1065,7 @@ class DeepCFRTrainer:
                     self._best_score = score
                     self.save_checkpoint(os.path.join(cfg.checkpoint_dir, "best.pt"),
                                          meta={"iter": t, "score_mbbg": score,
+                                               "eval_include_human_like": cfg.eval_include_human_like,
                                                "eval": eval_payload})
 
             latest_interval = max(1, int(cfg.latest_checkpoint_interval))
@@ -1081,6 +1090,21 @@ class DeepCFRTrainer:
                         os.path.join(cfg.checkpoint_dir, "best_lbr.pt"),
                         meta={"iter": t, "lbr_mbbg": float(lbr_mbbg)},
                     )
+                safety_score = _safety_score(eval_payload, lbr_mbbg)
+                if safety_score is not None:
+                    self.writer.add_scalar("eval/safety_score_mbbg", safety_score, t)
+                    if safety_score > self._best_safety_score:
+                        self._best_safety_score = safety_score
+                        self.save_checkpoint(
+                            os.path.join(cfg.checkpoint_dir, "best_safety.pt"),
+                            meta={
+                                "iter": t,
+                                "safety_score_mbbg": safety_score,
+                                "lbr_mbbg": float(lbr_mbbg),
+                                "eval_include_human_like": cfg.eval_include_human_like,
+                                "eval": eval_payload,
+                            },
+                        )
 
             if t % max(1, cfg.log_interval) == 0:
                 eval_str = (
@@ -1089,6 +1113,9 @@ class DeepCFRTrainer:
                 )
                 if lbr_mbbg is not None:
                     eval_str += f" | lbr={lbr_mbbg:+.1f}mbb"
+                    safety_score = _safety_score(eval_payload, lbr_mbbg)
+                    if safety_score is not None:
+                        eval_str += f" | safety={safety_score:+.1f}mbb"
                 if proxy_stats:
                     proxy_l1 = [s["strategy_l1"] for s in proxy_stats]
                     eval_str += " | proxy_l1 " + ",".join(f"{x:.4f}" for x in proxy_l1)
@@ -1171,10 +1198,18 @@ class DeepCFRTrainer:
             self.iter = 0
 
         meta = payload.get("meta", {}) or {}
-        if "score_mbbg" in meta:
+        if (
+            "score_mbbg" in meta
+            and bool(meta.get("eval_include_human_like", False)) == bool(self.cfg.eval_include_human_like)
+        ):
             self._best_score = float(meta["score_mbbg"])
         if "lbr_mbbg" in meta:
             self._best_lbr = float(meta["lbr_mbbg"])
+        if (
+            "safety_score_mbbg" in meta
+            and bool(meta.get("eval_include_human_like", False)) == bool(self.cfg.eval_include_human_like)
+        ):
+            self._best_safety_score = float(meta["safety_score_mbbg"])
         logger.info(
             "loaded Deep CFR checkpoint %s | iter=%d | restore_iteration=%s | buffers=%s",
             path, int(payload.get("iter", 0)), restore_iteration, restored_buffers,
