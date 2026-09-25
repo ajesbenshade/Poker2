@@ -78,19 +78,53 @@ def test_realistic_river_converges():
     assert late < 0.005, "under 0.5% of the pot after 500 iterations"
 
 
+@pytest.fixture
+def deterministic_kernels():
+    previous = torch.are_deterministic_algorithms_enabled()
+    torch.use_deterministic_algorithms(True)
+    yield
+    torch.use_deterministic_algorithms(previous)
+
+
+# Run-to-run noise: index_add_ on CUDA sums with atomics, so repeated runs differ
+# in the last bits and, because many hands are indifferent between actions,
+# follow different paths to equally good strategies. Measured on the precision
+# spot below: exploitability after 200 iterations spreads 0.17-0.27% of the pot,
+# after 1000 iterations 0.022-0.025%; deterministic and default kernels have the
+# same means. Tests therefore compare bit for bit under deterministic kernels, or
+# compare exploitability late in the run.
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-def test_gpu_float32_agrees_with_cpu_float64():
+def test_cuda_graph_replay_is_bit_identical_to_eager(deterministic_kernels):
+    spot = RiverSpot(contrib=(500, 500), stack=20000, first_to_act=1)
+    rng = np.random.default_rng(8)
+    ranges = [rng.random(NUM_COMBOS), rng.random(NUM_COMBOS)]
+    board = parse_cards("Kc9h6d5s2h")
+    graphed = RiverSolver(spot, board, ranges, device="cuda", use_cuda_graph=True)
+    eager = RiverSolver(spot, board, ranges, device="cuda", use_cuda_graph=False)
+    graphed.iterate(50)  # warm-up, capture, then replays
+    eager.iterate(50)
+    assert graphed._graph is not None, "the graph was captured"
+    assert torch.equal(graphed.regret, eager.regret)
+    assert torch.equal(graphed.strategy_sum, eager.strategy_sum)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_float32_converges_as_far_as_float64():
+    # The risk with float32 is rounding stalling convergence, so check that it
+    # keeps improving alongside float64. Compare exploitability, not strategies:
+    # equilibria are not unique. Measured (% of pot, float32 / float64):
+    # 1000 it 0.0235 / 0.0231, 2000 it 0.0080 / 0.0079, 8000 it 0.0010 / 0.0010.
     spot = RiverSpot(contrib=(1000, 1000), stack=20000, first_to_act=1,
                      bet_sizes=(0.5, 1.0), raise_sizes=(1.0,), max_raises=2)
     rng = np.random.default_rng(3)
     ranges = [rng.random(NUM_COMBOS), rng.random(NUM_COMBOS)]
     board = parse_cards("AhJd7c5s3h")
-    gpu = RiverSolver(spot, board, ranges, device="cuda", dtype=torch.float32)
-    cpu = RiverSolver(spot, board, ranges, device="cpu", dtype=torch.float64)
-    gpu.iterate(200)
-    cpu.iterate(200)
-    # Compare exploitability, not strategies: equilibria are not unique (many
-    # hands are indifferent between actions), so rounding differences steer the
-    # two runs to different but equally good mixes. Measured: 0.2414% vs 0.2429%
-    # of the pot, while single-combo frequencies differed by up to 0.28.
-    assert gpu.exploitability()[1] == pytest.approx(cpu.exploitability()[1], abs=1e-4)
+    single = RiverSolver(spot, board, ranges, device="cuda", dtype=torch.float32)
+    double = RiverSolver(spot, board, ranges, device="cuda", dtype=torch.float64)
+    single.iterate(2000)
+    double.iterate(2000)
+    s, d = single.exploitability()[1], double.exploitability()[1]
+    assert s < 2e-4 and d < 2e-4, "both under 0.02% of the pot"
+    assert 0.5 < s / d < 2.0, f"float32 {s:.3%} vs float64 {d:.3%}"

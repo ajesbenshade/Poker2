@@ -19,6 +19,12 @@ launched thousands of tiny kernels and was no faster than the CPU):
 The algorithm is Discounted CFR (Brown & Sandholm 2019) with the usual poker
 parameters alpha = 1.5, beta = 0, gamma = 2 and alternating updates.
 exploitability() computes an exact best response for each player.
+
+On CUDA, one full iteration (both players' passes and the discounting) is
+recorded once as a CUDA graph and replayed, so the CPU no longer launches its
+kernels one by one. The per-iteration discount factors live in GPU tensors
+that are updated before each replay; a Python number would be frozen into the
+recording.
 """
 
 import numpy as np
@@ -39,8 +45,10 @@ def _overlap_matrix() -> np.ndarray:
 
 
 class RiverSolver:
+    WARMUP_ITERATIONS = 3  # eager iterations on a side stream before recording the graph
+
     def __init__(self, spot: RiverSpot, board, ranges, device="cuda", dtype=torch.float32,
-                 alpha=1.5, beta=0.0, gamma=2.0):
+                 alpha=1.5, beta=0.0, gamma=2.0, use_cuda_graph=True):
         if len(board) != 5:
             raise ValueError("a river board has 5 cards")
         self.spot = spot
@@ -101,6 +109,14 @@ class RiverSolver:
         self.strategy_sum = torch.zeros(shape, dtype=dtype, device=dev)
         self.iterations = 0
 
+        # DCFR factors for the current iteration, as tensors so a graph can read them.
+        self._pos_factor = torch.zeros((), dtype=dtype, device=dev)
+        self._neg_factor = torch.zeros((), dtype=dtype, device=dev)
+        self._strat_factor = torch.zeros((), dtype=dtype, device=dev)
+        self.use_cuda_graph = use_cuda_graph and self.device.type == "cuda"
+        self._graph = None
+        self._side_stream = torch.cuda.Stream(device=dev) if self.use_cuda_graph else None
+
     # -- building blocks -------------------------------------------------------
 
     def _normalize(self, weights):
@@ -154,22 +170,45 @@ class RiverSolver:
         self.regret += torch.where(mine[:, None], regret_delta, 0.0)
         self.strategy_sum += torch.where(mine[:, None], reach[player][self.parent] * sigma, 0.0)
 
-    def _discount(self, player):
+    def _set_discount_factors(self):
         t = self.iterations
-        pos = t ** self.alpha / (t ** self.alpha + 1)
-        neg = t ** self.beta / (t ** self.beta + 1)
-        strat = (t / (t + 1)) ** self.gamma
+        self._pos_factor.fill_(t ** self.alpha / (t ** self.alpha + 1))
+        self._neg_factor.fill_(t ** self.beta / (t ** self.beta + 1))
+        self._strat_factor.fill_((t / (t + 1)) ** self.gamma)
+
+    def _discount(self, player):
         mine = self.edges_of[player][:, None]
-        self.regret *= torch.where(mine, torch.where(self.regret > 0, pos, neg), 1.0)
-        self.strategy_sum *= torch.where(mine, strat, 1.0)
+        factor = torch.where(self.regret > 0, self._pos_factor, self._neg_factor)
+        self.regret *= torch.where(mine, factor, 1.0)
+        self.strategy_sum *= torch.where(mine, self._strat_factor, 1.0)
+
+    def _iteration(self):
+        for player in (0, 1):
+            self._traverse(player)
+            self._discount(player)
 
     def iterate(self, count=1):
         with torch.no_grad():
             for _ in range(count):
                 self.iterations += 1
-                for player in (0, 1):
-                    self._traverse(player)
-                    self._discount(player)
+                self._set_discount_factors()
+                if not self.use_cuda_graph:
+                    self._iteration()
+                elif self._graph is not None:
+                    self._graph.replay()
+                elif self.iterations <= self.WARMUP_ITERATIONS:
+                    # PyTorch requires warm-up runs on a side stream before capture.
+                    self._side_stream.wait_stream(torch.cuda.current_stream(self.device))
+                    with torch.cuda.stream(self._side_stream):
+                        self._iteration()
+                    torch.cuda.current_stream(self.device).wait_stream(self._side_stream)
+                else:
+                    # Recording does not execute anything, so replay once for this iteration.
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        self._iteration()
+                    self._graph = graph
+                    self._graph.replay()
 
     # -- strategies and evaluation ---------------------------------------------
 

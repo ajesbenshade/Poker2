@@ -90,11 +90,13 @@ Reference results (all checked by the test suite):
 
 `search/` holds the real-time subgame solvers, written in PyTorch for the RTX 3080. So far: a
 vectorized Discounted CFR river solver (`search/river_solver.py`) that processes the tree level by
-level, so each iteration is ~100 GPU kernels and all showdowns are one matrix product. On the
-blueprint's river bet sizes it runs ~260 iterations/s and reaches 0.16% of the pot in exploitability
-in under 2 seconds, about 12x the best CPU version. Tests check a NumPy port of the hand evaluator
-against the published counts, an analytic polarized-river equilibrium, exact exploitability, and
-GPU float32 against CPU float64.
+level, so each iteration is ~100 GPU kernels and all showdowns are one matrix product, and records
+one iteration as a CUDA graph that is replayed thereafter. On the blueprint's river bet sizes it
+runs ~1,060 iterations/s (~260 without the graph) and reaches 0.02% of the pot in exploitability in
+under 2 seconds, about 50x the best CPU version. Tests check a NumPy port of the hand evaluator
+against the published counts, an analytic polarized-river equilibrium, exact exploitability, graph
+replay bit-identical to eager execution under deterministic kernels, and float32 converging as far
+as float64.
 
 Setup (native Windows; install torch from the CUDA index only, since PyPI's Windows torch is CPU-only):
 
