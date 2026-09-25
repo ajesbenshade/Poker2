@@ -14,6 +14,9 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for the full plan and current status.
 - **Hold'em engine** (`engine/src/holdem/`): heads-up no-limit rules with Slumbot's
   200bb setup and action strings, a 7-card hand evaluator, a suit-isomorphism hand indexer,
   and the blueprint's action abstraction.
+- **Card abstraction** (`engine/src/abstraction/`): exact river equity and opponent-cluster
+  hand strength, distribution-aware turn and flop features, multithreaded k-means, and the
+  runtime bucket lookup.
 - **Toy games:** Kuhn poker and Leduc hold'em (`engine/src/games/`), used to validate solvers exactly.
 - **Solvers:** CFR+ as the exact reference solver, and external-sampling MCCFR with optional
   Linear CFR weighting, which is the algorithm the HUNL blueprint will use (`engine/src/cfr/`).
@@ -37,6 +40,15 @@ engine/build/poker2_tree
 ```bash
 engine/build/poker2_bench
 ```
+
+Build the card abstraction (writes about 2.5 GB to `~/poker2-data/abstraction` on the WSL disk):
+
+```bash
+engine/build/poker2_abstraction
+```
+
+It runs the stages `preflop,equity,river,turn,flop,report`; `--stages` reruns a subset, and
+`--buckets FLOP,TURN,RIVER` changes bucket counts.
 
 Plot a convergence curve:
 

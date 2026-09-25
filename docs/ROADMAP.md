@@ -49,14 +49,36 @@ trim sizes or buckets.
 Single-thread throughput (`poker2_bench`): 7-card evaluation 59M/s, river isomorphism index
 13.5M/s, flop index 15.8M/s, random deals 30M/s, random abstract hand playouts 4.3M/s.
 
+## Card abstraction results
+
+`poker2_abstraction` builds everything in about 8.5 minutes on 24 threads, writing 2.4 GB to
+`~/poker2-data/abstraction`:
+
+| Stage | Time | Result |
+|---|---|---|
+| Preflop | 2 s | 169 lossless buckets; 8 opponent clusters by preflop equity (AA 85.2%, 32o 32.3%) |
+| River equity + OCHS | 113 s | Exact equity vs all 990 opponent hands for 123,156,254 classes |
+| River | 52 s | 1,500 buckets on OCHS vectors; k-means explains 98.5% (hit the 50-iteration cap) |
+| Turn | 154 s | 2,000 buckets on 46-value equity distributions; explains 99.6% |
+| Flop | 164 s | 2,000 buckets on 50-bin runout distributions; explains 99.5% |
+
+Quality report on 500K random deals per street: every bucket occupied; largest bucket 0.20% /
+0.51% / 1.21% of hands (flop / turn / river); buckets explain 99.90% / 99.90% / 99.66% of
+equity variance. Bucket ids are sorted by strength, and spot checks land where expected:
+royal flush 1499/1500, top set 1999/2000, a straight-flush draw mid-range (1010/2000),
+air near the bottom.
+
+The equity R^2 is a sanity check rather than proof of quality, since the features are built
+from the same equities. The real test is the pilot run's exploitability and head-to-head results.
+
 ## Schedule
 
 | Days | Phase | Done when | Status |
 |---|---|---|---|
 | 1-2 | CFR core validated on Kuhn and Leduc | Exact exploitability goes to ~0; published game values match | **Done** |
 | 3-6 | HUNL engine: rules, hand evaluator, isomorphism, action abstraction, tests | Evaluator and isomorphism match published counts exactly; random games replay correctly | **Done** |
-| 5-8 | Card abstraction (CPU equity, k-means clustering) | Bucket files written and quality-checked | Next |
-| 8-9 | 24-hour pilot with a small abstraction | Local-best-response exploitability falling | |
+| 5-8 | Card abstraction (CPU equity, k-means clustering) | Bucket files written and quality-checked | **Done** |
+| 8-9 | 24-hour pilot with a small abstraction | Local-best-response exploitability falling | Next |
 | 9-27 | Full blueprint run (~18 days x 24 threads) | Checkpoint every 12 h, each evaluated automatically | |
 | 12-25 | Real-time search and value network | Search beats the blueprint alone head-to-head | |
 | 27-30 | Final evaluation vs Slumbot, 20k+ hands with AIVAT | Checkpoint chosen by exploitability and head-to-head, never by average utility | |
