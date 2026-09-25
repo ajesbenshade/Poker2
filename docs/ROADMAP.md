@@ -71,6 +71,26 @@ air near the bottom.
 The equity R^2 is a sanity check rather than proof of quality, since the features are built
 from the same equities. The real test is the pilot run's exploitability and head-to-head results.
 
+## Blueprint trainer
+
+`engine/src/blueprint/`: the betting tree is flattened into arrays (658,128 decision nodes);
+regrets and averages live in per-street float tables indexed by (node, bucket, action), updated
+by all threads without locks through relaxed `std::atomic_ref`. External-sampling MCCFR as
+validated on Leduc, plus a regret floor, Pluribus-style pruning (skip actions with regret below
+-3e8 with probability 0.95, never on the river or for hand-ending actions), and Linear CFR as
+k/(k+1) discounting between epochs.
+
+Validation:
+- **Push/fold at 10bb** (exact exploitability over all 1326 x 1225 hand pairs): 141 -> ~3 mbb/hand
+  in 4M iterations; AA pushes and calls, 72o folds to a shove.
+- **Small postflop game:** LBR falls from ~1,036 to ~590 mbb/hand with 1M iterations; the trained
+  strategy beats random and always-call bots.
+- Terminal payoffs match the rules engine; tree statistics match `count_tree`; checkpoints
+  round-trip exactly and reject a mismatched layout; single-thread runs are reproducible.
+
+Throughput with the full blueprint bet sizes and 200-bucket abstraction: ~310,000 iterations/s
+on 24 threads (each iteration traverses once per player), ~27 billion iterations per day.
+
 ## Schedule
 
 | Days | Phase | Done when | Status |
@@ -78,7 +98,7 @@ from the same equities. The real test is the pilot run's exploitability and head
 | 1-2 | CFR core validated on Kuhn and Leduc | Exact exploitability goes to ~0; published game values match | **Done** |
 | 3-6 | HUNL engine: rules, hand evaluator, isomorphism, action abstraction, tests | Evaluator and isomorphism match published counts exactly; random games replay correctly | **Done** |
 | 5-8 | Card abstraction (CPU equity, k-means clustering) | Bucket files written and quality-checked | **Done** |
-| 8-9 | 24-hour pilot with a small abstraction | Local-best-response exploitability falling | Next |
+| 8-9 | 24-hour pilot with a small abstraction | Local-best-response exploitability falling | Trainer done; pilot running |
 | 9-27 | Full blueprint run (~18 days x 24 threads) | Checkpoint every 12 h, each evaluated automatically | |
 | 12-25 | Real-time search and value network | Search beats the blueprint alone head-to-head | |
 | 27-30 | Final evaluation vs Slumbot, 20k+ hands with AIVAT | Checkpoint chosen by exploitability and head-to-head, never by average utility | |

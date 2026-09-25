@@ -9,7 +9,7 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for the full plan and current status.
 
 ## Engine (C++)
 
-`engine/` is a dependency-free C++17 library. It currently contains:
+`engine/` is a dependency-free C++20 library. It currently contains:
 
 - **Hold'em engine** (`engine/src/holdem/`): heads-up no-limit rules with Slumbot's
   200bb setup and action strings, a 7-card hand evaluator, a suit-isomorphism hand indexer,
@@ -17,12 +17,16 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for the full plan and current status.
 - **Card abstraction** (`engine/src/abstraction/`): exact river equity and opponent-cluster
   hand strength, distribution-aware turn and flop features, multithreaded k-means, and the
   runtime bucket lookup.
+- **Blueprint trainer** (`engine/src/blueprint/`): flat betting tree, dense lock-free regret
+  tables, multithreaded external-sampling MCCFR with Linear CFR discounting and pruning,
+  checkpoints, local best response (LBR) and head-to-head evaluation, and an exact push/fold
+  exploitability check.
 - **Toy games:** Kuhn poker and Leduc hold'em (`engine/src/games/`), used to validate solvers exactly.
 - **Solvers:** CFR+ as the exact reference solver, and external-sampling MCCFR with optional
   Linear CFR weighting, which is the algorithm the HUNL blueprint will use (`engine/src/cfr/`).
 - **Evaluation:** exact best response, exploitability and profile value (`engine/src/cfr/evaluation.h`).
 
-Build and test inside WSL (Ubuntu 24.04, g++ 13):
+Build and test inside WSL (Ubuntu 24.04, g++ 13, C++20):
 
 ```bash
 make -C engine test
@@ -50,6 +54,15 @@ engine/build/poker2_abstraction
 It runs the stages `preflop,equity,river,turn,flop,report`; `--stages` reruns a subset, and
 `--buckets FLOP,TURN,RIVER` changes bucket counts.
 
+Train a blueprint (the 24-hour pilot settings are in `engine/scripts/pilot.sh`):
+
+```bash
+engine/scripts/pilot.sh
+```
+
+Progress goes to `~/poker2-runs/pilot/train.log` and `metrics.csv`. Stop cleanly with
+`pkill -TERM poker2_train` (it checkpoints first) and continue with `engine/scripts/pilot.sh --resume`.
+
 Plot a convergence curve:
 
 ```bash
@@ -69,6 +82,7 @@ Reference results (all checked by the test suite):
 | 7-card hands (all 133.8M) | Published category counts; exactly 4,824 distinct values |
 | Isomorphism classes | 169 / 1,286,792 / 13,960,050 / 123,156,254, plus the perfect-recall 55,190,538 and 2,428,287,420 |
 | Blueprint tree | 1.03B infosets, 11.5 GB of tables |
+| Blueprint trainer on push/fold (10bb) | Exact exploitability 141 -> ~3 mbb/hand in 4M iterations |
 
 ## Legacy Python trainer
 

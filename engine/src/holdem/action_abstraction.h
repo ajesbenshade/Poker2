@@ -23,6 +23,16 @@ struct ActionAbstraction {
   std::array<std::vector<std::vector<double>>, 4> raise_sizes;
   int max_raises_per_street = 3;  // no raising at all once reached
   bool allow_all_in = true;       // offer all-in whenever raising is allowed
+  bool allow_open_limp = true;    // small blind may just call as its first action
+
+  // Small blind folds or goes all-in; big blind folds or calls. Exact
+  // exploitability is computable for this game, which validates the trainer.
+  static ActionAbstraction push_fold() {
+    ActionAbstraction a;
+    a.allow_open_limp = false;
+    a.max_raises_per_street = 1;
+    return a;
+  }
 
   // First proposal for the blueprint; tune with poker2_tree before training.
   static ActionAbstraction blueprint() {
@@ -45,7 +55,8 @@ struct ActionAbstraction {
     out.clear();
     if (s.is_terminal()) return;
     if (s.can_fold()) out.push_back(Action::fold());
-    out.push_back(Action::check_call());
+    const bool open_limp = s.street() == kPreflop && s.to_act() == 0 && s.raises_this_street() == 0;
+    if (allow_open_limp || !open_limp) out.push_back(Action::check_call());
     if (!s.can_raise() || s.raises_this_street() >= max_raises_per_street) return;
 
     const auto& levels = raise_sizes[s.street()];

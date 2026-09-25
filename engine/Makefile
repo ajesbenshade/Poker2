@@ -4,14 +4,14 @@
 #   make -C engine             build everything into engine/build/
 
 CXX ?= g++
-CXXFLAGS ?= -O2 -march=native -std=c++17 -Wall -Wextra -Wpedantic
+CXXFLAGS ?= -O2 -march=native -std=c++20 -Wall -Wextra -Wpedantic
 CPPFLAGS += -Isrc
 LDLIBS += -pthread
 
 BUILD := build
 HEADERS := $(wildcard src/*/*.h)
 TEST_SOURCES := $(wildcard tests/*.cpp)
-TOOLS := poker2_solve poker2_tree poker2_bench poker2_abstraction
+TOOLS := poker2_solve poker2_tree poker2_bench poker2_abstraction poker2_train
 
 .PHONY: all test test-slow clean
 
@@ -33,6 +33,9 @@ $(BUILD)/poker2_bench: tools/bench.cpp $(HEADERS) | $(BUILD)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< -o $@ $(LDLIBS)
 
 $(BUILD)/poker2_abstraction: tools/abstraction.cpp $(HEADERS) | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< -o $@ $(LDLIBS)
+
+$(BUILD)/poker2_train: tools/train.cpp $(HEADERS) | $(BUILD)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< -o $@ $(LDLIBS)
 
 test: $(BUILD)/poker2_tests
