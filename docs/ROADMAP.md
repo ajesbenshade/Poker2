@@ -88,8 +88,16 @@ Validation:
 - Terminal payoffs match the rules engine; tree statistics match `count_tree`; checkpoints
   round-trip exactly and reject a mismatched layout; single-thread runs are reproducible.
 
-Throughput with the full blueprint bet sizes and 200-bucket abstraction: ~310,000 iterations/s
-on 24 threads (each iteration traverses once per player), ~27 billion iterations per day.
+Throughput with the full blueprint bet sizes and 200-bucket abstraction: ~140,000-160,000
+iterations/s on 24 threads once the strategy is past uniform (each iteration traverses once per
+player), about 12-14 billion iterations per day. A fresh run starts near 300,000/s because
+random play shoves and folds, ending hands early; the first pilot schedule was sized from
+that and had to be rescaled.
+
+Pilot operations: the first launch died during its second epoch without a trace (the WSL
+journal was lost to clock-jump log rotation). The trainer now ignores SIGHUP, records fatal
+signals in `train.log`, and runs in its own session; `engine/scripts/start_pilot.ps1` launches
+it detached from any terminal.
 
 ## Schedule
 

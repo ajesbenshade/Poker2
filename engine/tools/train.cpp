@@ -24,6 +24,9 @@
 #include <sstream>
 #include <string>
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include "abstraction/card_abstraction.h"
 #include "blueprint/betting_tree.h"
 #include "blueprint/evaluation.h"
@@ -39,6 +42,19 @@ namespace {
 
 std::atomic<bool> g_stop{false};
 void on_signal(int) { g_stop = true; }
+
+// A crash in a detached run otherwise leaves no trace, so fatal signals are
+// recorded in train.log (with async-signal-safe calls only) before dying.
+int g_log_fd = -1;
+void on_fatal(int sig) {
+  char msg[] = "[fatal] poker2_train killed by signal    \n";
+  msg[sizeof(msg) - 4] = static_cast<char>('0' + sig / 10);
+  msg[sizeof(msg) - 3] = static_cast<char>('0' + sig % 10);
+  if (g_log_fd >= 0) (void)!write(g_log_fd, msg, sizeof(msg) - 1);
+  (void)!write(2, msg, sizeof(msg) - 1);
+  std::signal(sig, SIG_DFL);
+  std::raise(sig);
+}
 
 struct Args {
   std::string abstraction_dir;
@@ -164,6 +180,9 @@ int main(int argc, char** argv) {
   Log log(args.run_dir + "/train.log");
   std::signal(SIGINT, on_signal);
   std::signal(SIGTERM, on_signal);
+  std::signal(SIGHUP, SIG_IGN);  // keep training if the launching session goes away
+  g_log_fd = open((args.run_dir + "/train.log").c_str(), O_WRONLY | O_APPEND);
+  for (int sig : {SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGABRT}) std::signal(sig, on_fatal);
 
   log("loading card abstraction from %s", args.abstraction_dir.c_str());
   const abstraction::CardAbstraction cards = abstraction::CardAbstraction::load(args.abstraction_dir);
@@ -269,5 +288,6 @@ int main(int argc, char** argv) {
   log(g_stop ? "stop requested" : "time or iteration limit reached");
   checkpoint();
   evaluate();
+  log("exiting normally");
   return 0;
 }

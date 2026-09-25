@@ -54,14 +54,15 @@ engine/build/poker2_abstraction
 It runs the stages `preflop,equity,river,turn,flop,report`; `--stages` reruns a subset, and
 `--buckets FLOP,TURN,RIVER` changes bucket counts.
 
-Train a blueprint (the 24-hour pilot settings are in `engine/scripts/pilot.sh`):
+Train a blueprint (the 24-hour pilot settings are in `engine/scripts/pilot.sh`). From Windows,
+start it detached so it keeps running after the terminal closes:
 
-```bash
-engine/scripts/pilot.sh
+```powershell
+powershell -ExecutionPolicy Bypass -File engine\scripts\start_pilot.ps1
 ```
 
 Progress goes to `~/poker2-runs/pilot/train.log` and `metrics.csv`. Stop cleanly with
-`pkill -TERM poker2_train` (it checkpoints first) and continue with `engine/scripts/pilot.sh --resume`.
+`pkill -TERM -x poker2_train` (it checkpoints first) and continue with `engine/scripts/pilot.sh --resume`.
 
 Plot a convergence curve:
 
