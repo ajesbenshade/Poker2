@@ -11,7 +11,10 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for the full plan and current status.
 
 `engine/` is a dependency-free C++17 library. It currently contains:
 
-- **Games:** Kuhn poker and Leduc hold'em (`engine/src/games/`), used to validate solvers exactly.
+- **Hold'em engine** (`engine/src/holdem/`): heads-up no-limit rules with Slumbot's
+  200bb setup and action strings, a 7-card hand evaluator, a suit-isomorphism hand indexer,
+  and the blueprint's action abstraction.
+- **Toy games:** Kuhn poker and Leduc hold'em (`engine/src/games/`), used to validate solvers exactly.
 - **Solvers:** CFR+ as the exact reference solver, and external-sampling MCCFR with optional
   Linear CFR weighting, which is the algorithm the HUNL blueprint will use (`engine/src/cfr/`).
 - **Evaluation:** exact best response, exploitability and profile value (`engine/src/cfr/evaluation.h`).
@@ -20,6 +23,19 @@ Build and test inside WSL (Ubuntu 24.04, g++ 13):
 
 ```bash
 make -C engine test
+```
+
+`make -C engine test-slow` adds the exhaustive checks: all 133,784,560 seven-card hands, every
+flop deal, and full turn and river isomorphism round trips (about 35 seconds).
+
+Size the blueprint's betting tree and memory, and benchmark the building blocks:
+
+```bash
+engine/build/poker2_tree
+```
+
+```bash
+engine/build/poker2_bench
 ```
 
 Plot a convergence curve:
@@ -37,6 +53,10 @@ Reference results (all checked by the test suite):
 | Kuhn CFR+ game value | -1/18, P1 strategy matches the unique equilibrium |
 | Leduc CFR+ game value, 2k iterations | -0.08560 (published: -0.0856), exploitability 8e-5 |
 | Leduc ES-MCCFR, 3M iterations (about 8 s) | exploitability ~0.006-0.008 chips/hand |
+| 5-card hands | Published category counts; exactly 7,462 distinct values |
+| 7-card hands (all 133.8M) | Published category counts; exactly 4,824 distinct values |
+| Isomorphism classes | 169 / 1,286,792 / 13,960,050 / 123,156,254, plus the perfect-recall 55,190,538 and 2,428,287,420 |
+| Blueprint tree | 1.03B infosets, 11.5 GB of tables |
 
 ## Legacy Python trainer
 
