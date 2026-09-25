@@ -23,3 +23,6 @@ runs/
 *.swo
 .idea/
 .vscode/
+
+# C++ engine build output
+engine/build/

@@ -1,65 +1,47 @@
 # Poker2
-Aaron's latest attempt at a GTO poker player
+Aaron's latest attempt at a GTO poker player.
 
-## Current Training Baseline
+The goal is a heads-up no-limit hold'em agent built the way Libratus and
+Pluribus were: a real game engine, card and action abstraction, an MCCFR
+blueprint trained on the CPU, and real-time subgame solving at play time.
+It targets one machine (Ryzen 9 7900X, 64 GB RAM, RTX 3080) over about a month.
+See [docs/ROADMAP.md](docs/ROADMAP.md) for the full plan and current status.
 
-The repo still trains a tabular MCCFR baseline, but the foundation has been refactored so future Deep CFR work can plug into explicit seams instead of rewriting the whole trainer.
+## Engine (C++)
 
-- Richer infosets now carry acting player, street, pot, stack sizes, board cards, private cards, and current bet while preserving a legacy key mode for the existing tabular path.
-- Environment transitions and payoff sampling are separated behind a simplified poker environment adapter.
-- Node storage is pluggable, with local execution as a fallback when Ray is unavailable.
-- Neural-ready observation encoding lives in [abstractions.py](./abstractions.py) via `encode_infoset` and `encode_infosets`.
-- A first local-only Deep CFR path now exists with per-player advantage replay, an average-strategy replay buffer, two advantage networks, and one average-strategy network.
+`engine/` is a dependency-free C++17 library. It currently contains:
 
-This workspace does not contain the larger Actor-Critic, MCTS, or EquityNet stack mentioned in earlier design notes. The live code is a heads-up MCCFR plus Deep CFR trainer, and the current runtime hardening is scoped to that code path.
+- **Games:** Kuhn poker and Leduc hold'em (`engine/src/games/`), used to validate solvers exactly.
+- **Solvers:** CFR+ as the exact reference solver, and external-sampling MCCFR with optional
+  Linear CFR weighting, which is the algorithm the HUNL blueprint will use (`engine/src/cfr/`).
+- **Evaluation:** exact best response, exploitability and profile value (`engine/src/cfr/evaluation.h`).
 
-## Smoke Test
-
-Use a tiny local run to validate the trainer end to end before launching a large job:
-
-```bash
-.venv/bin/python train.py --smoke-test
-```
-
-This produces `strategies.npy` and `strategies.json` using the local fallback path if Ray is not installed.
-
-## Deep CFR Preview
-
-Use deep mode to exercise the first neural slice. This path forces state-key infosets automatically and writes both strategy exports and a model checkpoint.
+Build and test inside WSL (Ubuntu 24.04, g++ 13):
 
 ```bash
-.venv/bin/python train.py --mode deep --smoke-test --max-depth 2
+make -C engine test
 ```
 
-This produces `strategies.npy`, `strategies.json`, and `strategies.pt` from the local Deep CFR trainer.
-
-## ROCm Safe Mode
-
-The trainer now defaults to a hardware-safe profile aimed at long, stable ROCm runs on a 20 GB GPU with large system RAM. Key changes:
-
-- ROCm-friendly allocator environment variables are set at startup in both [train.py](./train.py) and [deep_cfr.py](./deep_cfr.py).
-- Monte Carlo equity simulation stays on CPU via `Config.SIMULATION_DEVICE`, which keeps rollout work off the GPU.
-- Deep mode uses array-backed replay buffers, optional gradient checkpointing, scaler-aware AMP, and aggressive cache clearing after large steps.
-- Runtime backoff automatically halves simulation batch size, equity rollouts, neural batch size, train steps, and Deep CFR traversals when VRAM exceeds 15.5 GB or RAM exceeds 78 percent.
-- Checkpoints now include model, optimizer, scaler, and replay-buffer state. The trainer also writes `best_strategies.*` and `best_model.pt` when it reaches a new best average utility.
-
-Resume a Deep CFR run from a saved checkpoint with:
+Plot a convergence curve:
 
 ```bash
-.venv/bin/python train.py --mode deep --resume-checkpoint checkpoint_10000.pt
+engine/build/poker2_solve --game leduc --algo mccfr --iters 3000000 --eval-every 300000 --csv leduc.csv
 ```
 
-Run indefinitely until interrupted with:
+Reference results (all checked by the test suite):
 
-```bash
-.venv/bin/python train.py --mode deep --long-run
-```
+| Check | Result |
+|---|---|
+| Leduc infosets | 288 (textbook count) |
+| Kuhn best response vs uniform | 1/2 and 5/12, exact |
+| Kuhn CFR+ game value | -1/18, P1 strategy matches the unique equilibrium |
+| Leduc CFR+ game value, 2k iterations | -0.08560 (published: -0.0856), exploitability 8e-5 |
+| Leduc ES-MCCFR, 3M iterations (about 8 s) | exploitability ~0.006-0.008 chips/hand |
 
-Recommended environment variables before launching a long run:
+## Legacy Python trainer
 
-```bash
-export HIP_VISIBLE_DEVICES=0
-export HSA_OVERRIDE_GFX_VERSION=11_0_0
-export PYTORCH_HIP_ALLOC_CONF=garbage_collection_threshold:0.6,max_split_size_mb:128
-export PYTORCH_CUDA_ALLOC_CONF="$PYTORCH_HIP_ALLOC_CONF"
-```
+The Python files at the repo root (`train.py`, `cfr.py`, `game.py`, ...) are the previous
+trainer. They are kept for reference but should not be used for training: payoffs come from a
+heuristic formula rather than poker outcomes, infosets never see their own cards, and the tree
+stops after two actions. See the roadmap for details. They will move to `legacy/` once the
+C++ engine can play full hands.
