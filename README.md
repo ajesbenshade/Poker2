@@ -86,6 +86,32 @@ Reference results (all checked by the test suite):
 | Blueprint tree | 1.03B infosets, 22.9 GB of tables (float regrets; double preflop/flop averages) |
 | Blueprint trainer on push/fold (10bb) | Exact exploitability 141 -> ~3 mbb/hand in 4M iterations |
 
+## GPU search (Python, Windows)
+
+`search/` holds the real-time subgame solvers, written in PyTorch for the RTX 3080. So far: a
+vectorized Discounted CFR river solver (`search/river_solver.py`) that processes the tree level by
+level, so each iteration is ~100 GPU kernels and all showdowns are one matrix product. On the
+blueprint's river bet sizes it runs ~260 iterations/s and reaches 0.16% of the pot in exploitability
+in under 2 seconds, about 12x the best CPU version. Tests check a NumPy port of the hand evaluator
+against the published counts, an analytic polarized-river equilibrium, exact exploitability, and
+GPU float32 against CPU float64.
+
+Setup (native Windows; install torch from the CUDA index only, since PyPI's Windows torch is CPU-only):
+
+```powershell
+py -3.12 -m venv .venv
+.venv\Scripts\python -m pip install numpy pytest
+.venv\Scripts\python -m pip install torch --index-url https://download.pytorch.org/whl/cu130
+```
+
+```powershell
+.venv\Scripts\python -m pytest search -q
+```
+
+```powershell
+.venv\Scripts\python -m search.bench_river
+```
+
 ## Legacy Python trainer
 
 The Python files at the repo root (`train.py`, `cfr.py`, `game.py`, ...) are the previous
