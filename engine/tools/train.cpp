@@ -69,6 +69,7 @@ struct Args {
   double eval_minutes = 60.0;
   uint64_t lbr_hands = 20000;
   uint64_t h2h_deals = 20000;
+  std::string average_streets = "0123";  // streets that store average strategies
   int threads = default_threads();
   uint64_t seed = 1;
   bool resume = false;
@@ -79,7 +80,8 @@ struct Args {
                "usage: poker2_train --abstraction DIR --run DIR [--profile blueprint|small|push_fold]\n"
                "                    [--hours H] [--max-iterations N] [--epoch N] [--linear-until N]\n"
                "                    [--prune-after N] [--checkpoint-minutes M] [--eval-minutes M]\n"
-               "                    [--lbr-hands N] [--h2h-deals N] [--threads N] [--seed S] [--resume]\n");
+               "                    [--lbr-hands N] [--h2h-deals N] [--threads N] [--seed S] [--resume]\n"
+               "                    [--average-streets 0123]  (streets storing averages; default all)\n");
   std::exit(2);
 }
 
@@ -103,6 +105,7 @@ Args parse(int argc, char** argv) {
     else if (f == "--eval-minutes") a.eval_minutes = std::atof(next().c_str());
     else if (f == "--lbr-hands") a.lbr_hands = std::strtoull(next().c_str(), nullptr, 10);
     else if (f == "--h2h-deals") a.h2h_deals = std::strtoull(next().c_str(), nullptr, 10);
+    else if (f == "--average-streets") a.average_streets = next();
     else if (f == "--threads") a.threads = std::atoi(next().c_str());
     else if (f == "--seed") a.seed = std::strtoull(next().c_str(), nullptr, 10);
     else if (f == "--resume") a.resume = true;
@@ -135,7 +138,9 @@ std::string config_text(const Args& a, const TableLayout& layout) {
     << "epoch " << a.epoch << "\n"
     << "linear_until " << a.linear_until << "\n"
     << "prune_after " << a.prune_after << "\n"
-    << "seed " << a.seed << "\n";
+    << "seed " << a.seed << "\n"
+    << "average_streets " << a.average_streets << "\n"
+    << "table_value_bytes " << sizeof(TableValue) << "\n";
   return s.str();
 }
 
@@ -188,7 +193,10 @@ int main(int argc, char** argv) {
   const abstraction::CardAbstraction cards = abstraction::CardAbstraction::load(args.abstraction_dir);
   const BettingTree tree(make_profile(args.profile));
   TableLayout layout;
-  for (int s = 0; s < 4; ++s) layout.buckets[s] = cards.num_buckets(s);
+  for (int s = 0; s < 4; ++s) {
+    layout.buckets[s] = cards.num_buckets(s);
+    layout.store_average[s] = args.average_streets.find(static_cast<char>('0' + s)) != std::string::npos;
+  }
 
   const std::string config = config_text(args, layout);
   const std::string config_path = args.run_dir + "/config.txt";

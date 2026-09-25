@@ -208,7 +208,35 @@ TEST("blueprint strategy: checkpoint round trip and mismatch detection") {
   std::remove(file.c_str());
 }
 
-TEST("blueprint evaluation: LBR punishes an untrained strategy and training reduces it") {
+TEST("blueprint trainer: board-blind postflop game converges (exact exploitability)") {
+  // Bucket = preflop class on every street: perfect recall, board-blind, so the
+  // exact best response over all combo pairs applies. Four streets, pot-size
+  // bets, two raises per street, all-ins.
+  const holdem::GameConfig config = stack_of(1000);
+  const BettingTree tree(small_abstraction(), config);
+  const abstraction::CardAbstraction cards = abstraction::CardAbstraction::preflop_classes_only();
+  TableLayout layout;
+  layout.buckets = {169, 169, 169, 169};
+  StrategyTables tables(tree, layout);
+  TrainerOptions opt;
+  opt.threads = 16;
+  BlueprintTrainer trainer(tree, cards, tables, opt);
+  const AllInEquity eq(400, 3, 16);
+  auto exploitability_mbb = [&] {
+    return board_blind_exploitability(tree, tables, eq).exploitability() / config.big_blind * 1000.0;
+  };
+  trainer.run(100000, 0);
+  const double early = exploitability_mbb();
+  for (int epoch = 1; epoch <= 39; ++epoch) trainer.run(100000, epoch);
+  const double late = exploitability_mbb();
+  std::printf("    board-blind exploitability: %.1f mbb/hand after 100K iterations, %.1f after 4M\n",
+              early, late);
+  // Measured: ~299 at 100K, ~33 at 4M, ~11 at 16M, ~1.3 at 256M.
+  check(late < early / 5.0, "exploitability falls at least 5x");
+  check_below(late, 45.0, "exploitability in mbb/hand after 4M iterations");
+}
+
+TEST("blueprint evaluation: LBR and head-to-head against baseline agents") {
   const holdem::GameConfig config = stack_of(1000);
   const BettingTree tree(small_abstraction(), config);
   const abstraction::CardAbstraction cards = coarse_abstraction(3);
@@ -226,8 +254,9 @@ TEST("blueprint evaluation: LBR punishes an untrained strategy and training redu
   std::printf("    LBR: untrained %.0f +/- %.0f mbb/hand, trained %.0f +/- %.0f\n",
               untrained.mbb_per_hand, untrained.stderr_mbb, trained.mbb_per_hand, trained.stderr_mbb);
   check(untrained.mbb_per_hand > 5 * untrained.stderr_mbb, "LBR clearly beats the uniform strategy");
-  check(trained.mbb_per_hand < untrained.mbb_per_hand - 3 * (trained.stderr_mbb + untrained.stderr_mbb),
-        "training lowers LBR by a clear margin");
+  // No "training lowers LBR" check: with one postflop bucket this game has
+  // imperfect recall, and LBR is a heuristic bound; convergence is checked
+  // exactly by the board-blind test instead.
 
   const MatchResult vs_random =
       head_to_head(tree, cards, blueprint_agent(tables), random_agent(), 40000, 5, 16);

@@ -44,11 +44,22 @@ class CardAbstraction {
     num_buckets_[street] = num_buckets;
   }
 
+  // For validation: every street's bucket is the preflop class (169), so players
+  // remember their hand but never see the board. This keeps the abstract game
+  // perfect-recall, which CFR's guarantees and exact best responses require.
+  static CardAbstraction preflop_classes_only() {
+    CardAbstraction a;
+    a.hole_class_only_ = true;
+    a.num_buckets_.fill(169);
+    return a;
+  }
+
   const holdem::HandIndexer& indexer(int street) const { return indexers_[street]; }
   int num_buckets(int street) const { return num_buckets_[street]; }
 
   // board must hold 0, 3, 4 or 5 cards for streets 0..3.
   int bucket(int street, const holdem::Card hole[2], const holdem::Card* board) const {
+    if (hole_class_only_) return static_cast<int>(indexers_[0].index(hole));
     static constexpr int kBoardCards[] = {0, 3, 4, 5};
     holdem::Card cards[7] = {hole[0], hole[1]};
     for (int i = 0; i < kBoardCards[street]; ++i) cards[2 + i] = board[i];
@@ -59,6 +70,7 @@ class CardAbstraction {
   std::array<holdem::HandIndexer, 4> indexers_;
   std::array<std::vector<uint16_t>, 4> tables_;
   std::array<int, 4> num_buckets_{};
+  bool hole_class_only_ = false;
 };
 
 }  // namespace poker2::abstraction

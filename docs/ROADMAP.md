@@ -83,6 +83,10 @@ k/(k+1) discounting between epochs.
 Validation:
 - **Push/fold at 10bb** (exact exploitability over all 1326 x 1225 hand pairs): 141 -> ~3 mbb/hand
   in 4M iterations; AA pushes and calls, 72o folds to a shove.
+- **Board-blind four-street game** (10bb, pot-size bets, two raises per street; bucket = preflop
+  class on every street, so perfect recall and an exact best response apply): exploitability
+  299 -> 83 -> 33 -> 11 -> 3.7 -> 1.3 mbb/hand at 0.1M / 1M / 4M / 16M / 64M / 256M iterations,
+  halving with every 4x as sampled CFR should. This is the check that postflop training is correct.
 - **Small postflop game:** LBR falls from ~1,036 to ~590 mbb/hand with 1M iterations; the trained
   strategy beats random and always-call bots.
 - Terminal payoffs match the rules engine; tree statistics match `count_tree`; checkpoints
@@ -98,6 +102,33 @@ Pilot operations: the first launch died during its second epoch without a trace 
 journal was lost to clock-jump log rotation). The trainer now ignores SIGHUP, records fatal
 signals in `train.log`, and runs in its own session; `engine/scripts/start_pilot.ps1` launches
 it detached from any terminal.
+
+## Pilot attempt 2: LBR plateau (2026-09-25)
+
+The second pilot ran 3.85B iterations (6.5 hours) and LBR stayed flat at ~3,800 mbb/hand from
+30 minutes on. Diagnosis, with side experiments on the small bet-size profile:
+
+| Setup | LBR at 120M+ iterations |
+|---|---|
+| 200 buckets, average strategy on all streets | ~1,430 |
+| 200 buckets, current strategy on turn and river (the pilot's setup) | ~2,800 |
+| 2,000 buckets, average strategy on all streets | ~1,250 (360M) |
+| 2,000 buckets, pilot's setup | ~2,500 |
+
+- **Main cause: evaluating the turn and river with the current strategy.** Only preflop and flop
+  stored averages (as in Pluribus, which replaced later streets with real-time search). MCCFR's
+  current strategy does not converge, and reading it roughly doubles LBR. Averages are now stored
+  on every street by default (`--average-streets`).
+- **The trainer is correct:** the exact board-blind check above converges to ~1 mbb/hand.
+- **float vs double: no measured difference** up to 256M iterations (exact check: 1.27 vs 1.28).
+  Tables are double anyway, because an 18-day run would push preflop sums past float's 2^24 limit.
+  An earlier LBR comparison that seemed to implicate float was within noise.
+- **The remaining LBR floor** is only partly explained by bucket count (200 -> 2,000 lowered it
+  ~180 mbb/hand, about one standard error). LBR is a heuristic lower bound and noisy at +/-110, and
+  real card abstractions have imperfect recall, where CFR has no guarantee. An extreme case (one
+  postflop bucket, so players forget their hand after the flop) had exact exploitability *rise*
+  50 -> 118 mbb/hand with training even though the trainer is correct. Fine-grained abstractions
+  forget much less, but this is why the pilot is judged by trend, not by an absolute LBR target.
 
 ## Schedule
 
