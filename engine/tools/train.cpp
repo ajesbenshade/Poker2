@@ -1,17 +1,23 @@
 // Trains the HUNL blueprint.
 //
 //   poker2_train --abstraction DIR --run DIR [--profile blueprint|small|push_fold]
-//                [--hours H] [--max-iterations N] [--epoch N] [--linear-until N]
-//                [--prune-after N] [--checkpoint-minutes M] [--eval-minutes M]
-//                [--lbr-hands N] [--h2h-deals N] [--threads N] [--seed S] [--resume]
+//                [--hours H] [--max-iterations N] [--epoch N]
+//                [--linear-minutes M | --linear-until N] [--prune-after-minutes M | --prune-after N]
+//                [--checkpoint-minutes M] [--eval-minutes M] [--lbr-hands N] [--h2h-deals N]
+//                [--average-streets 0123] [--threads N] [--seed S] [--resume]
 //
 // Work is split into epochs of --epoch iterations. Between epochs:
-//   - Linear CFR: while iterations < --linear-until, all regrets and averages
-//     are scaled by k/(k+1) after epoch k (Pluribus-style discounting);
+//   - Linear CFR: during the first --linear-minutes of training time (or while
+//     iterations <= --linear-until), all regrets and averages are scaled by
+//     k/(k+1) after epoch k (Pluribus-style discounting);
+//   - pruning switches on after --prune-after-minutes (or --prune-after iterations);
 //   - checkpoints and evaluations run on their own timers.
+// Training time excludes evaluation and checkpoints and survives --resume.
+// Prefer the minute-based options: throughput depends on the abstraction and on
+// how far training has progressed, so iteration counts are hard to size ahead.
 // Ctrl-C or SIGTERM finishes the current epoch, checkpoints, and exits.
 //
-// Files in --run: config.txt, train.log, metrics.csv, checkpoint.bin
+// Files in --run: config.txt, state.txt, train.log, metrics.csv, checkpoint.bin
 
 #include <atomic>
 #include <chrono>
@@ -65,6 +71,8 @@ struct Args {
   uint64_t epoch = 1000000;
   uint64_t linear_until = 0;
   uint64_t prune_after = 0;  // 0 = never
+  double linear_minutes = 0.0;
+  double prune_after_minutes = 0.0;  // 0 = never
   double checkpoint_minutes = 60.0;
   double eval_minutes = 60.0;
   uint64_t lbr_hands = 20000;
@@ -78,8 +86,10 @@ struct Args {
 [[noreturn]] void usage() {
   std::fprintf(stderr,
                "usage: poker2_train --abstraction DIR --run DIR [--profile blueprint|small|push_fold]\n"
-               "                    [--hours H] [--max-iterations N] [--epoch N] [--linear-until N]\n"
-               "                    [--prune-after N] [--checkpoint-minutes M] [--eval-minutes M]\n"
+               "                    [--hours H] [--max-iterations N] [--epoch N]\n"
+               "                    [--linear-minutes M | --linear-until N]\n"
+               "                    [--prune-after-minutes M | --prune-after N]\n"
+               "                    [--checkpoint-minutes M] [--eval-minutes M]\n"
                "                    [--lbr-hands N] [--h2h-deals N] [--threads N] [--seed S] [--resume]\n"
                "                    [--average-streets 0123]  (streets storing averages; default all)\n");
   std::exit(2);
@@ -101,6 +111,8 @@ Args parse(int argc, char** argv) {
     else if (f == "--epoch") a.epoch = std::strtoull(next().c_str(), nullptr, 10);
     else if (f == "--linear-until") a.linear_until = std::strtoull(next().c_str(), nullptr, 10);
     else if (f == "--prune-after") a.prune_after = std::strtoull(next().c_str(), nullptr, 10);
+    else if (f == "--linear-minutes") a.linear_minutes = std::atof(next().c_str());
+    else if (f == "--prune-after-minutes") a.prune_after_minutes = std::atof(next().c_str());
     else if (f == "--checkpoint-minutes") a.checkpoint_minutes = std::atof(next().c_str());
     else if (f == "--eval-minutes") a.eval_minutes = std::atof(next().c_str());
     else if (f == "--lbr-hands") a.lbr_hands = std::strtoull(next().c_str(), nullptr, 10);
@@ -138,9 +150,11 @@ std::string config_text(const Args& a, const TableLayout& layout) {
     << "epoch " << a.epoch << "\n"
     << "linear_until " << a.linear_until << "\n"
     << "prune_after " << a.prune_after << "\n"
+    << "linear_minutes " << a.linear_minutes << "\n"
+    << "prune_after_minutes " << a.prune_after_minutes << "\n"
     << "seed " << a.seed << "\n"
-    << "average_streets " << a.average_streets << "\n"
-    << "table_value_bytes " << sizeof(TableValue) << "\n";
+    << "average_bytes " << layout.average_bytes(0) << " " << layout.average_bytes(1) << " "
+    << layout.average_bytes(2) << " " << layout.average_bytes(3) << "\n";
   return s.str();
 }
 
@@ -175,6 +189,27 @@ class Log {
 
 double minutes_since(Clock::time_point t) {
   return std::chrono::duration<double>(Clock::now() - t).count() / 60.0;
+}
+
+// MemAvailable from /proc/meminfo, in bytes (0 if unknown).
+uint64_t available_memory() {
+  std::ifstream in("/proc/meminfo");
+  std::string key, unit;
+  uint64_t kb = 0;
+  while (in >> key >> kb >> unit) {
+    if (key == "MemAvailable:") return kb * 1024;
+  }
+  return 0;
+}
+
+double read_trained_seconds(const std::string& path) {
+  std::ifstream in(path);
+  std::string key;
+  double value = 0.0;
+  while (in >> key >> value) {
+    if (key == "trained_seconds") return value;
+  }
+  return 0.0;
 }
 
 }  // namespace
@@ -217,14 +252,26 @@ int main(int argc, char** argv) {
     std::ofstream(config_path) << config;
   }
 
+  const uint64_t needed = layout.memory_bytes(tree);
+  const uint64_t available = available_memory();
+  if (available && needed + (2ull << 30) > available) {
+    log("tables need %.1f GB but only %.1f GB is available (keeping 2 GB spare); "
+        "raise WSL memory in .wslconfig or use a smaller abstraction",
+        needed / 1e9, available / 1e9);
+    return 1;
+  }
   StrategyTables tables(tree, layout);
   log("tree: %zu decision nodes, %zu terminals; buckets %d/%d/%d/%d; tables %.2f GB",
       tree.num_nodes(), tree.num_terminals(), layout.buckets[0], layout.buckets[1], layout.buckets[2],
       layout.buckets[3], tables.memory_bytes() / 1e9);
+  const std::string state_path = args.run_dir + "/state.txt";
   uint64_t iterations = 0;
+  double trained_seconds = 0.0;  // time spent in training epochs, across resumes
   if (args.resume) {
     iterations = tables.load(checkpoint_path);
-    log("resumed from %s at %lu iterations", checkpoint_path.c_str(), iterations);
+    trained_seconds = read_trained_seconds(state_path);
+    log("resumed from %s at %lu iterations, %.0f training minutes", checkpoint_path.c_str(), iterations,
+        trained_seconds / 60.0);
   }
 
   const bool new_metrics = !std::filesystem::exists(args.run_dir + "/metrics.csv");
@@ -241,7 +288,9 @@ int main(int argc, char** argv) {
   auto checkpoint = [&] {
     const auto t = Clock::now();
     tables.save(checkpoint_path, iterations);
-    log("checkpoint at %lu iterations (%.0fs)", iterations, minutes_since(t) * 60.0);
+    std::ofstream(state_path) << "iterations " << iterations << "\ntrained_seconds " << trained_seconds << "\n";
+    log("checkpoint at %lu iterations, %.0f training minutes (%.0fs)", iterations, trained_seconds / 60.0,
+        minutes_since(t) * 60.0);
     last_checkpoint = Clock::now();
   };
   auto evaluate = [&] {
@@ -274,20 +323,26 @@ int main(int argc, char** argv) {
     TrainerOptions opt;
     opt.seed = args.seed;
     opt.threads = args.threads;
-    opt.pruning = args.prune_after > 0 && iterations >= args.prune_after;
+    const double trained_minutes = trained_seconds / 60.0;
+    opt.pruning = (args.prune_after > 0 && iterations >= args.prune_after) ||
+                  (args.prune_after_minutes > 0 && trained_minutes >= args.prune_after_minutes);
     BlueprintTrainer trainer(tree, cards, tables, opt);
     const uint64_t epoch_index = iterations / args.epoch;
     const auto t = Clock::now();
     trainer.run(args.epoch, epoch_index);
+    const double epoch_seconds = minutes_since(t) * 60.0;
     iterations += args.epoch;
-    rate = args.epoch / (minutes_since(t) * 60.0);
+    trained_seconds += epoch_seconds;
+    rate = args.epoch / epoch_seconds;
 
-    if (iterations <= args.linear_until) {
+    const bool linear = (args.linear_until > 0 && iterations <= args.linear_until) ||
+                        (args.linear_minutes > 0 && trained_minutes < args.linear_minutes);
+    if (linear) {
       const double k = static_cast<double>(epoch_index + 1);
-      tables.scale(static_cast<float>(k / (k + 1.0)), args.threads);
+      tables.scale(k / (k + 1.0), args.threads);
     }
-    log("epoch %lu: %lu iterations, %.0f it/s%s%s", epoch_index + 1, iterations, rate,
-        opt.pruning ? ", pruning" : "", iterations <= args.linear_until ? ", linear discount" : "");
+    log("epoch %lu: %lu iterations, %.0f it/s, %.0f training minutes%s%s", epoch_index + 1, iterations,
+        rate, trained_seconds / 60.0, opt.pruning ? ", pruning" : "", linear ? ", linear discount" : "");
 
     if (minutes_since(last_checkpoint) >= args.checkpoint_minutes) checkpoint();
     if (minutes_since(last_eval) >= args.eval_minutes) evaluate();

@@ -7,12 +7,15 @@
 // nothing on x86 and keeps the races well-defined; an occasional lost update is
 // harmless noise for MCCFR.
 //
-// Table values are double by default. At blueprint scale, float32 stops
-// accumulating: past 2^24 (~16.7M) adding 1.0 is lost entirely, and an 18-day
-// run visits each preflop bucket ~2 billion times. Up to 256M iterations the
-// exact board-blind check shows no float/double difference (1.27 vs 1.28
-// mbb/hand), so -DPOKER2_TABLE_VALUE=float is an option for short runs where
-// memory matters.
+// Precision, chosen so the full blueprint fits in memory:
+//   - Regrets are float. Updates are chip-sized, so float resolution relative to
+//     the sums is ample (exact board-blind check: float and double tables agree,
+//     1.27 vs 1.28 mbb/hand at 256M iterations).
+//   - Average strategies add probabilities (<= 1) per visit. Past 2^24 (~16.7M)
+//     a float sum cannot absorb even 1.0, and a multi-day run visits each preflop
+//     bucket billions of times, so preflop and flop averages are double. Turn and
+//     river infosets number ~900M and are each visited rarely, so float is safe.
+// Full blueprint (169/2000/2000/1500 buckets): ~22.6 GB, vs ~45 GB all-double.
 
 #include <array>
 #include <atomic>
@@ -21,18 +24,13 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "blueprint/betting_tree.h"
 #include "core/parallel.h"
 
-#ifndef POKER2_TABLE_VALUE
-#define POKER2_TABLE_VALUE double
-#endif
-
 namespace poker2::blueprint {
-
-using TableValue = POKER2_TABLE_VALUE;
 
 template <class T>
 T load_relaxed(const T& x) {
@@ -44,7 +42,7 @@ void store_relaxed(T& x, T v) {
 }
 
 // Positive-regret matching over n actions; uniform when no regret is positive.
-inline void regret_matching(const TableValue* regret, int n, float* out) {
+inline void regret_matching(const float* regret, int n, float* out) {
   double positive[BettingTree::kMaxActions];
   double total = 0.0;
   for (int a = 0; a < n; ++a) {
@@ -62,6 +60,23 @@ struct TableLayout {
   // Average strategies on every street by default: MCCFR's current strategy does
   // not converge, and reading the turn and river from it roughly doubled LBR.
   std::array<bool, 4> store_average{true, true, true, true};
+  // Streets whose averages are double rather than float (see top of file).
+  std::array<bool, 4> double_average{true, true, false, false};
+
+  // Bytes per average entry on a street: 0 (not stored), 4 or 8.
+  int average_bytes(int street) const {
+    return store_average[street] ? (double_average[street] ? 8 : 4) : 0;
+  }
+
+  // Table memory a layout needs for a tree, without allocating it.
+  uint64_t memory_bytes(const BettingTree& tree) const {
+    uint64_t total = 0;
+    for (int s = 0; s <= tree.max_street(); ++s) {
+      const uint64_t entries = tree.street_slots(s) * static_cast<uint64_t>(buckets[s]);
+      total += entries * (sizeof(float) + average_bytes(s));
+    }
+    return total;
+  }
 };
 
 class StrategyTables {
@@ -69,14 +84,15 @@ class StrategyTables {
   StrategyTables(const BettingTree& tree, const TableLayout& layout) : tree_(tree), layout_(layout) {
     for (int s = 0; s <= tree.max_street(); ++s) {
       const size_t size = tree.street_slots(s) * static_cast<size_t>(layout.buckets[s]);
-      regret_[s].assign(size, TableValue(0));
-      if (layout.store_average[s]) average_[s].assign(size, TableValue(0));
+      regret_[s].assign(size, 0.0f);
+      if (layout.average_bytes(s) == 8) average_d_[s].assign(size, 0.0);
+      if (layout.average_bytes(s) == 4) average_f_[s].assign(size, 0.0f);
     }
   }
 
   const BettingTree& tree() const { return tree_; }
   const TableLayout& layout() const { return layout_; }
-  bool has_average(int street) const { return !average_[street].empty(); }
+  bool has_average(int street) const { return !average_d_[street].empty() || !average_f_[street].empty(); }
 
   // For diagnostics: make play_strategy ignore stored averages on these streets.
   void set_play_current(int street, bool current) { play_current_[street] = current; }
@@ -84,12 +100,21 @@ class StrategyTables {
   size_t offset(const TreeNode& n, int bucket) const {
     return n.slot_offset * layout_.buckets[n.street] + static_cast<size_t>(bucket) * n.num_actions;
   }
-  TableValue* regret(const TreeNode& n, int bucket) { return regret_[n.street].data() + offset(n, bucket); }
-  const TableValue* regret(const TreeNode& n, int bucket) const {
+  float* regret(const TreeNode& n, int bucket) { return regret_[n.street].data() + offset(n, bucket); }
+  const float* regret(const TreeNode& n, int bucket) const {
     return regret_[n.street].data() + offset(n, bucket);
   }
-  TableValue* average(const TreeNode& n, int bucket) {
-    return average_[n.street].data() + offset(n, bucket);
+
+  // Adds `sigma` to the average-strategy sums at (n, bucket), if stored.
+  void add_average(const TreeNode& n, int bucket, const float* sigma) {
+    const size_t o = offset(n, bucket);
+    if (!average_d_[n.street].empty()) {
+      double* s = average_d_[n.street].data() + o;
+      for (int a = 0; a < n.num_actions; ++a) store_relaxed(s[a], load_relaxed(s[a]) + sigma[a]);
+    } else if (!average_f_[n.street].empty()) {
+      float* s = average_f_[n.street].data() + o;
+      for (int a = 0; a < n.num_actions; ++a) store_relaxed(s[a], load_relaxed(s[a]) + sigma[a]);
+    }
   }
 
   void current_strategy(const TreeNode& n, int bucket, float* out) const {
@@ -102,32 +127,44 @@ class StrategyTables {
       current_strategy(n, bucket, out);
       return;
     }
-    const TableValue* s = average_[n.street].data() + offset(n, bucket);
+    const size_t o = offset(n, bucket);
+    double sums[BettingTree::kMaxActions];
     double total = 0.0;
-    for (int a = 0; a < n.num_actions; ++a) total += load_relaxed(s[a]);
+    for (int a = 0; a < n.num_actions; ++a) {
+      sums[a] = !average_d_[n.street].empty() ? load_relaxed(average_d_[n.street][o + a])
+                                              : load_relaxed(average_f_[n.street][o + a]);
+      total += sums[a];
+    }
     if (total <= 0.0) {
       current_strategy(n, bucket, out);
       return;
     }
-    for (int a = 0; a < n.num_actions; ++a) out[a] = static_cast<float>(load_relaxed(s[a]) / total);
+    for (int a = 0; a < n.num_actions; ++a) out[a] = static_cast<float>(sums[a] / total);
   }
 
   // Linear CFR discounting: scales every accumulated regret and average by `factor`.
   // Call only while no training threads are running.
   void scale(double factor, int threads = 1) {
-    const TableValue f = static_cast<TableValue>(factor);
-    auto scale_table = [&](std::vector<TableValue>& table) {
+    auto scale_table = [&](auto& table) {
+      using T = typename std::decay_t<decltype(table)>::value_type;
+      const T f = static_cast<T>(factor);
       parallel_ranges(table.size(), threads, [&](uint64_t b, uint64_t e, int) {
         for (uint64_t i = b; i < e; ++i) table[i] *= f;
       });
     };
-    for (auto& table : regret_) scale_table(table);
-    for (auto& table : average_) scale_table(table);
+    for (int s = 0; s < 4; ++s) {
+      scale_table(regret_[s]);
+      scale_table(average_d_[s]);
+      scale_table(average_f_[s]);
+    }
   }
 
   uint64_t memory_bytes() const {
     uint64_t total = 0;
-    for (int s = 0; s < 4; ++s) total += (regret_[s].size() + average_[s].size()) * sizeof(TableValue);
+    for (int s = 0; s < 4; ++s) {
+      total += regret_[s].size() * sizeof(float) + average_d_[s].size() * sizeof(double) +
+               average_f_[s].size() * sizeof(float);
+    }
     return total;
   }
 
@@ -138,14 +175,14 @@ class StrategyTables {
     Header h = header(iterations);
     bool ok = std::fwrite(&h, sizeof(h), 1, f) == 1;
     for (int s = 0; s < 4 && ok; ++s) {
-      ok = write_all(f, regret_[s]) && write_all(f, average_[s]);
+      ok = write_all(f, regret_[s]) && write_all(f, average_d_[s]) && write_all(f, average_f_[s]);
     }
     if (std::fclose(f) != 0 || !ok) throw std::runtime_error("write failed: " + tmp);
     if (std::rename(tmp.c_str(), path.c_str()) != 0) throw std::runtime_error("rename failed: " + path);
   }
 
   // Returns the saved iteration count. Throws if the file was written for a
-  // different tree or bucket layout.
+  // different tree, bucket layout, or precision.
   uint64_t load(const std::string& path) {
     FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) throw std::runtime_error("cannot open " + path);
@@ -153,63 +190,68 @@ class StrategyTables {
     const Header expected = header(0);
     bool ok = std::fread(&saved, sizeof(saved), 1, f) == 1;
     if (!ok || std::memcmp(saved.magic, expected.magic, 8) != 0 || saved.version != expected.version ||
-        saved.value_bytes != expected.value_bytes ||
         saved.num_nodes != expected.num_nodes || saved.num_terminals != expected.num_terminals ||
         std::memcmp(saved.street_slots, expected.street_slots, sizeof(saved.street_slots)) != 0 ||
         std::memcmp(saved.buckets, expected.buckets, sizeof(saved.buckets)) != 0 ||
-        std::memcmp(saved.store_average, expected.store_average, sizeof(saved.store_average)) != 0) {
+        std::memcmp(saved.average_bytes, expected.average_bytes, sizeof(saved.average_bytes)) != 0) {
       std::fclose(f);
-      throw std::runtime_error("checkpoint does not match this tree and layout: " + path);
+      throw std::runtime_error("checkpoint does not match this tree, layout and precision: " + path);
     }
-    for (int s = 0; s < 4 && ok; ++s) ok = read_all(f, regret_[s]) && read_all(f, average_[s]);
+    for (int s = 0; s < 4 && ok; ++s) {
+      ok = read_all(f, regret_[s]) && read_all(f, average_d_[s]) && read_all(f, average_f_[s]);
+    }
     std::fclose(f);
     if (!ok) throw std::runtime_error("truncated checkpoint: " + path);
     return saved.iterations;
   }
 
-  bool operator==(const StrategyTables& o) const { return regret_ == o.regret_ && average_ == o.average_; }
+  bool operator==(const StrategyTables& o) const {
+    return regret_ == o.regret_ && average_d_ == o.average_d_ && average_f_ == o.average_f_;
+  }
 
  private:
   struct Header {
     char magic[8];
     uint32_t version;
-    uint32_t value_bytes;  // sizeof(TableValue) the file was written with
+    uint32_t pad;
     uint64_t iterations;
     uint64_t num_nodes;
     uint64_t num_terminals;
     uint64_t street_slots[4];
     int32_t buckets[4];
-    uint8_t store_average[4];
+    uint8_t average_bytes[4];  // per street: 0 (none), 4 (float), 8 (double); regrets are float
     uint32_t pad2;
   };
 
   Header header(uint64_t iterations) const {
     Header h{};
     std::memcpy(h.magic, "P2BLUEP", 8);
-    h.version = 2;
-    h.value_bytes = sizeof(TableValue);
+    h.version = 3;
     h.iterations = iterations;
     h.num_nodes = tree_.num_nodes();
     h.num_terminals = tree_.num_terminals();
     for (int s = 0; s < 4; ++s) {
       h.street_slots[s] = tree_.street_slots(s);
       h.buckets[s] = layout_.buckets[s];
-      h.store_average[s] = !average_[s].empty();
+      h.average_bytes[s] = static_cast<uint8_t>(!average_d_[s].empty() ? 8 : (!average_f_[s].empty() ? 4 : 0));
     }
     return h;
   }
 
-  static bool write_all(FILE* f, const std::vector<TableValue>& v) {
-    return v.empty() || std::fwrite(v.data(), sizeof(TableValue), v.size(), f) == v.size();
+  template <class T>
+  static bool write_all(FILE* f, const std::vector<T>& v) {
+    return v.empty() || std::fwrite(v.data(), sizeof(T), v.size(), f) == v.size();
   }
-  static bool read_all(FILE* f, std::vector<TableValue>& v) {
-    return v.empty() || std::fread(v.data(), sizeof(TableValue), v.size(), f) == v.size();
+  template <class T>
+  static bool read_all(FILE* f, std::vector<T>& v) {
+    return v.empty() || std::fread(v.data(), sizeof(T), v.size(), f) == v.size();
   }
 
   const BettingTree& tree_;
   TableLayout layout_;
-  std::array<std::vector<TableValue>, 4> regret_;
-  std::array<std::vector<TableValue>, 4> average_;
+  std::array<std::vector<float>, 4> regret_;
+  std::array<std::vector<double>, 4> average_d_;
+  std::array<std::vector<float>, 4> average_f_;
   std::array<bool, 4> play_current_{};
 };
 

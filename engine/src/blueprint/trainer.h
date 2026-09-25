@@ -91,17 +91,12 @@ class BlueprintTrainer {
     const int acting = n.player;
     const int bucket = v.bucket[acting][n.street];
     const int count = n.num_actions;
-    TableValue* regret = tables_.regret(n, bucket);
+    float* regret = tables_.regret(n, bucket);
     float sigma[BettingTree::kMaxActions];
     regret_matching(regret, count, sigma);
 
     if (acting != player) {
-      if (tables_.has_average(n.street)) {
-        TableValue* avg = tables_.average(n, bucket);
-        for (int a = 0; a < count; ++a) {
-          store_relaxed(avg[a], static_cast<TableValue>(load_relaxed(avg[a]) + sigma[a]));
-        }
-      }
+      tables_.add_average(n, bucket, sigma);
       double r = std::uniform_real_distribution<double>(0.0, 1.0)(rng);
       int chosen = count - 1;
       for (int a = 0; a < count - 1; ++a) {
@@ -129,7 +124,7 @@ class BlueprintTrainer {
       if (!explored[a]) continue;
       const double updated = static_cast<double>(load_relaxed(regret[a])) + (values[a] - node_value);
       const double floored = updated > options_.regret_floor ? updated : options_.regret_floor;
-      store_relaxed(regret[a], static_cast<TableValue>(floored));
+      store_relaxed(regret[a], static_cast<float>(floored));
     }
     return node_value;
   }

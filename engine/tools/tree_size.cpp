@@ -2,9 +2,9 @@
 //
 //   poker2_tree [--buckets PRE,FLOP,TURN,RIVER]
 //
-// Memory model: one int32 regret per (node, action, bucket) on every street,
-// plus one float average-strategy entry on preflop and flop only (later streets
-// are played with real-time search).
+// Memory model (blueprint/strategy.h defaults): one float regret per (node,
+// action, bucket) on every street, plus an average-strategy entry that is double
+// on preflop and flop and float on turn and river.
 
 #include <chrono>
 #include <cstdio>
@@ -45,7 +45,7 @@ int main(int argc, char** argv) {
               "infosets", "GB");
   for (int s = 0; s < 4; ++s) {
     const uint64_t infosets = stats.decision_nodes[s] * buckets[s];
-    const double bytes_per_slot = s <= kFlop ? 8.0 : 4.0;
+    const double bytes_per_slot = s <= kFlop ? 12.0 : 8.0;
     const double gb = static_cast<double>(stats.action_slots[s]) * buckets[s] * bytes_per_slot / 1e9;
     total_gb += gb;
     total_infosets += infosets;

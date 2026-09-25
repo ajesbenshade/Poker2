@@ -100,7 +100,7 @@ that and had to be rescaled.
 
 Pilot operations: the first launch died during its second epoch without a trace (the WSL
 journal was lost to clock-jump log rotation). The trainer now ignores SIGHUP, records fatal
-signals in `train.log`, and runs in its own session; `engine/scripts/start_pilot.ps1` launches
+signals in `train.log`, and runs in its own session; `engine/scripts/start_run.ps1` launches
 it detached from any terminal.
 
 ## Pilot attempt 2: LBR plateau (2026-09-25)
@@ -130,6 +130,14 @@ The second pilot ran 3.85B iterations (6.5 hours) and LBR stayed flat at ~3,800 
   50 -> 118 mbb/hand with training even though the trainer is correct. Fine-grained abstractions
   forget much less, but this is why the pilot is judged by trend, not by an absolute LBR target.
 
+## Full blueprint run
+
+`engine/scripts/blueprint.sh`: blueprint bet sizes, 169/2,000/2,000/1,500 buckets. Tables use float
+regrets, double preflop/flop averages and float turn/river averages: 22.9 GB, which fits the current
+30 GB WSL limit (all-double would be ~45 GB). The schedule is by training time, as in Pluribus:
+Linear CFR for 400 minutes, pruning after 200 minutes, since iteration-based schedules were missized
+twice. Checkpoints every 2 hours, LBR and baseline matches every hour.
+
 ## Schedule
 
 | Days | Phase | Done when | Status |
@@ -137,8 +145,8 @@ The second pilot ran 3.85B iterations (6.5 hours) and LBR stayed flat at ~3,800 
 | 1-2 | CFR core validated on Kuhn and Leduc | Exact exploitability goes to ~0; published game values match | **Done** |
 | 3-6 | HUNL engine: rules, hand evaluator, isomorphism, action abstraction, tests | Evaluator and isomorphism match published counts exactly; random games replay correctly | **Done** |
 | 5-8 | Card abstraction (CPU equity, k-means clustering) | Bucket files written and quality-checked | **Done** |
-| 8-9 | 24-hour pilot with a small abstraction | Local-best-response exploitability falling | Trainer done; pilot running |
-| 9-27 | Full blueprint run (~18 days x 24 threads) | Checkpoint every 12 h, each evaluated automatically | |
+| 8-9 | 24-hour pilot with a small abstraction | Local-best-response exploitability falling | **Done**: trainer verified exactly; pilot hit the 200-bucket floor (LBR ~1,800) |
+| 9-27 | Full blueprint run (~18 days x 24 threads) | Checkpoint every 2 h, evaluated every hour | **Running** (started 2026-09-25) |
 | 12-25 | Real-time search and value network | Search beats the blueprint alone head-to-head | |
 | 27-30 | Final evaluation vs Slumbot, 20k+ hands with AIVAT | Checkpoint chosen by exploitability and head-to-head, never by average utility | |
 

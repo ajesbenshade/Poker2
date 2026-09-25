@@ -54,15 +54,16 @@ engine/build/poker2_abstraction
 It runs the stages `preflop,equity,river,turn,flop,report`; `--stages` reruns a subset, and
 `--buckets FLOP,TURN,RIVER` changes bucket counts.
 
-Train a blueprint (the 24-hour pilot settings are in `engine/scripts/pilot.sh`). From Windows,
-start it detached so it keeps running after the terminal closes:
+Train the blueprint. `engine/scripts/blueprint.sh` runs the full abstraction (~22.9 GB of tables)
+and `engine/scripts/pilot.sh` the 200-bucket pilot. From Windows, start either detached so it keeps
+running after the terminal closes:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File engine\scripts\start_pilot.ps1
+powershell -ExecutionPolicy Bypass -File engine\scripts\start_run.ps1 -Script blueprint
 ```
 
-Progress goes to `~/poker2-runs/pilot/train.log` and `metrics.csv`. Stop cleanly with
-`pkill -TERM -x poker2_train` (it checkpoints first) and continue with `engine/scripts/pilot.sh --resume`.
+Progress goes to `~/poker2-runs/<script>/train.log` and `metrics.csv`. Stop cleanly with
+`pkill -TERM -x poker2_train` (it checkpoints first) and continue with `engine/scripts/blueprint.sh --resume`.
 
 Plot a convergence curve:
 
@@ -82,7 +83,7 @@ Reference results (all checked by the test suite):
 | 5-card hands | Published category counts; exactly 7,462 distinct values |
 | 7-card hands (all 133.8M) | Published category counts; exactly 4,824 distinct values |
 | Isomorphism classes | 169 / 1,286,792 / 13,960,050 / 123,156,254, plus the perfect-recall 55,190,538 and 2,428,287,420 |
-| Blueprint tree | 1.03B infosets, 11.5 GB of tables |
+| Blueprint tree | 1.03B infosets, 22.9 GB of tables (float regrets; double preflop/flop averages) |
 | Blueprint trainer on push/fold (10bb) | Exact exploitability 141 -> ~3 mbb/hand in 4M iterations |
 
 ## Legacy Python trainer
