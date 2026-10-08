@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstdint>
 #include <stdexcept>
 #include <unordered_map>
@@ -135,7 +136,7 @@ class HandIndexer {
     for (int g = 0; g < num_groups(); ++g) {
       for (int s = 0; s < kNumSuits; ++s) {
         for (uint32_t m = masks[s][g]; m; m &= m - 1) {
-          cards[out++] = make_card(__builtin_ctz(m), s);
+          cards[out++] = make_card(std::countr_zero(m), s);
         }
       }
     }
@@ -193,17 +194,17 @@ class HandIndexer {
       uint64_t idx = 0;
       for (int g = 0; g < num_groups(); ++g) {
         const uint32_t m = masks[s][g];
-        const int n = __builtin_popcount(m);
+        const int n = std::popcount(m);
         shape |= static_cast<ShapeKey>(n) << (3 * g);
         // Colex rank of m among the ranks not in `used`.
         uint64_t sub = 0;
         int k = 1;
         for (uint32_t rest = m; rest; rest &= rest - 1, ++k) {
-          const int r = __builtin_ctz(rest);
-          const int position = r - __builtin_popcount(used & ((1u << r) - 1));
+          const int r = std::countr_zero(rest);
+          const int position = r - std::popcount(used & ((1u << r) - 1));
           sub += detail::binomial(position, k);
         }
-        idx = idx * detail::binomial(kNumRanks - __builtin_popcount(used), n) + sub;
+        idx = idx * detail::binomial(kNumRanks - std::popcount(used), n) + sub;
         used |= m;
       }
       cols.shape[s] = shape;
@@ -223,7 +224,7 @@ class HandIndexer {
     uint32_t used = 0;
     for (int g = 0; g < num_groups(); ++g) {
       const int n = count_in_group(shape, g);
-      const int available = kNumRanks - __builtin_popcount(used);
+      const int available = kNumRanks - std::popcount(used);
       uint64_t r = subs[g];
       uint32_t m = 0;
       for (int k = n; k >= 1; --k) {

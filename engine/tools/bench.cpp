@@ -19,7 +19,8 @@ void bench(const char* name, uint64_t iterations, F&& f) {
   uint64_t sink = 0;
   for (uint64_t i = 0; i < iterations; ++i) sink += f(i);
   const double secs = std::chrono::duration<double>(Clock::now() - start).count();
-  std::printf("%-34s %8.1f M/s   (checksum %lu)\n", name, iterations / secs / 1e6, sink);
+  std::printf("%-34s %8.1f M/s   (checksum %llu)\n", name, iterations / secs / 1e6,
+              static_cast<unsigned long long>(sink));
 }
 
 }  // namespace

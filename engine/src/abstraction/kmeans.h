@@ -77,7 +77,8 @@ inline KMeansResult kmeans_fit(const std::vector<float>& points, int dim,
     for (size_t i = 0; i < n; ++i)
       for (int d = 0; d < dim; ++d) mean[d] += point(i)[d];
     for (double& m : mean) m /= n;
-    std::vector<float> meanf(mean.begin(), mean.end());
+    std::vector<float> meanf(dim);
+    for (int d = 0; d < dim; ++d) meanf[d] = static_cast<float>(mean[d]);
     double total = 0.0;
     for (size_t i = 0; i < n; ++i) total += squared_distance(point(i), meanf.data(), dim);
     result.total_variance = total / n;

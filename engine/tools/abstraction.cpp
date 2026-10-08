@@ -68,7 +68,8 @@ std::vector<std::string> split(const std::string& s) {
 
 Args parse(int argc, char** argv) {
   Args a;
-  const char* home = std::getenv("HOME");
+  const char* home = std::getenv("HOME");                  // Linux
+  if (!home) home = std::getenv("USERPROFILE");            // Windows
   a.out = std::string(home ? home : ".") + "/poker2-data/abstraction";
   for (int i = 1; i < argc; ++i) {
     auto next = [&]() -> std::string {
@@ -224,7 +225,8 @@ void cluster_street(const Args& a, int street, uint64_t num_classes, int dim,
                       }
                     });
   write_table(path(a, street_file_name(street)), kBucketTable, num_classes, 1, r.k, buckets);
-  std::printf("  %s: assigned %lu classes in %.0fs\n", names[street], num_classes, seconds_since(start));
+  std::printf("  %s: assigned %llu classes in %.0fs\n", names[street],
+              static_cast<unsigned long long>(num_classes), seconds_since(start));
 }
 
 void stage_river(const Args& a) {
@@ -359,9 +361,9 @@ void stage_report(const Args& a) {
 int main(int argc, char** argv) {
   const Args a = parse(argc, argv);
   std::filesystem::create_directories(a.out);
-  std::printf("output: %s  threads: %d  buckets: %d/%d/%d/%d  sample: %d  seed: %lu\n",
+  std::printf("output: %s  threads: %d  buckets: %d/%d/%d/%d  sample: %d  seed: %llu\n",
               a.out.c_str(), a.threads, a.buckets[0], a.buckets[1], a.buckets[2], a.buckets[3],
-              a.sample, a.seed);
+              a.sample, static_cast<unsigned long long>(a.seed));
   const std::pair<const char*, void (*)(const Args&)> stages[] = {
       {"preflop", stage_preflop}, {"equity", stage_equity}, {"river", stage_river},
       {"turn", stage_turn},       {"flop", stage_flop},     {"report", stage_report}};

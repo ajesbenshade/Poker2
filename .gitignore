@@ -26,3 +26,6 @@ runs/
 
 # C++ engine build output
 engine/build/
+
+# Native Windows build output
+engine/build-win/

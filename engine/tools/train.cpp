@@ -31,7 +31,22 @@
 #include <string>
 
 #include <fcntl.h>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#define WIN32_LEAN_AND_MEAN
+#include <io.h>
+#include <windows.h>
+#define POKER2_OPEN _open
+#define POKER2_WRITE _write
+#define POKER2_APPEND_FLAGS (_O_WRONLY | _O_APPEND)
+#else
 #include <unistd.h>
+#define POKER2_OPEN open
+#define POKER2_WRITE write
+#define POKER2_APPEND_FLAGS (O_WRONLY | O_APPEND)
+#endif
 
 #include "abstraction/card_abstraction.h"
 #include "blueprint/betting_tree.h"
@@ -56,8 +71,8 @@ void on_fatal(int sig) {
   char msg[] = "[fatal] poker2_train killed by signal    \n";
   msg[sizeof(msg) - 4] = static_cast<char>('0' + sig / 10);
   msg[sizeof(msg) - 3] = static_cast<char>('0' + sig % 10);
-  if (g_log_fd >= 0) (void)!write(g_log_fd, msg, sizeof(msg) - 1);
-  (void)!write(2, msg, sizeof(msg) - 1);
+  if (g_log_fd >= 0) (void)!POKER2_WRITE(g_log_fd, msg, sizeof(msg) - 1);
+  (void)!POKER2_WRITE(2, msg, sizeof(msg) - 1);
   std::signal(sig, SIG_DFL);
   std::raise(sig);
 }
@@ -191,8 +206,13 @@ double minutes_since(Clock::time_point t) {
   return std::chrono::duration<double>(Clock::now() - t).count() / 60.0;
 }
 
-// MemAvailable from /proc/meminfo, in bytes (0 if unknown).
+// Physical memory available for new allocations, in bytes (0 if unknown).
 uint64_t available_memory() {
+#ifdef _WIN32
+  MEMORYSTATUSEX status{};
+  status.dwLength = sizeof(status);
+  return GlobalMemoryStatusEx(&status) ? status.ullAvailPhys : 0;
+#else
   std::ifstream in("/proc/meminfo");
   std::string key, unit;
   uint64_t kb = 0;
@@ -200,7 +220,10 @@ uint64_t available_memory() {
     if (key == "MemAvailable:") return kb * 1024;
   }
   return 0;
+#endif
 }
+
+unsigned long long ull(uint64_t x) { return static_cast<unsigned long long>(x); }
 
 double read_trained_seconds(const std::string& path) {
   std::ifstream in(path);
@@ -220,9 +243,19 @@ int main(int argc, char** argv) {
   Log log(args.run_dir + "/train.log");
   std::signal(SIGINT, on_signal);
   std::signal(SIGTERM, on_signal);
+#ifdef SIGHUP
   std::signal(SIGHUP, SIG_IGN);  // keep training if the launching session goes away
-  g_log_fd = open((args.run_dir + "/train.log").c_str(), O_WRONLY | O_APPEND);
-  for (int sig : {SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGABRT}) std::signal(sig, on_fatal);
+#endif
+  g_log_fd = POKER2_OPEN((args.run_dir + "/train.log").c_str(), POKER2_APPEND_FLAGS);
+  for (int sig : {SIGSEGV, SIGFPE, SIGILL, SIGABRT}) std::signal(sig, on_fatal);
+#ifdef SIGBUS
+  std::signal(SIGBUS, on_fatal);
+#endif
+  // Creating this file asks the run to finish its epoch, checkpoint and exit. It
+  // is the portable stop for detached runs (a Windows process started without a
+  // console cannot be sent Ctrl-C). A stale one from an earlier stop is removed.
+  const std::string stop_path = args.run_dir + "/STOP";
+  if (std::filesystem::remove(stop_path)) log("removed a STOP file left by an earlier run");
 
   log("loading card abstraction from %s", args.abstraction_dir.c_str());
   const abstraction::CardAbstraction cards = abstraction::CardAbstraction::load(args.abstraction_dir);
@@ -256,7 +289,7 @@ int main(int argc, char** argv) {
   const uint64_t available = available_memory();
   if (available && needed + (2ull << 30) > available) {
     log("tables need %.1f GB but only %.1f GB is available (keeping 2 GB spare); "
-        "raise WSL memory in .wslconfig or use a smaller abstraction",
+        "free memory (under WSL: raise it in .wslconfig) or use a smaller abstraction",
         needed / 1e9, available / 1e9);
     return 1;
   }
@@ -270,7 +303,7 @@ int main(int argc, char** argv) {
   if (args.resume) {
     iterations = tables.load(checkpoint_path);
     trained_seconds = read_trained_seconds(state_path);
-    log("resumed from %s at %lu iterations, %.0f training minutes", checkpoint_path.c_str(), iterations,
+    log("resumed from %s at %llu iterations, %.0f training minutes", checkpoint_path.c_str(), ull(iterations),
         trained_seconds / 60.0);
   }
 
@@ -289,8 +322,8 @@ int main(int argc, char** argv) {
     const auto t = Clock::now();
     tables.save(checkpoint_path, iterations);
     std::ofstream(state_path) << "iterations " << iterations << "\ntrained_seconds " << trained_seconds << "\n";
-    log("checkpoint at %lu iterations, %.0f training minutes (%.0fs)", iterations, trained_seconds / 60.0,
-        minutes_since(t) * 60.0);
+    log("checkpoint at %llu iterations, %.0f training minutes (%.0fs)", ull(iterations),
+        trained_seconds / 60.0, minutes_since(t) * 60.0);
     last_checkpoint = Clock::now();
   };
   auto evaluate = [&] {
@@ -304,9 +337,9 @@ int main(int argc, char** argv) {
                                        args.h2h_deals, args.seed + 1, args.threads);
     const MatchResult r = head_to_head(tree, cards, blueprint_agent(tables), random_agent(),
                                        args.h2h_deals, args.seed + 2, args.threads);
-    log("eval at %lu iterations: LBR %.0f +/- %.0f mbb/hand | vs always-call %+.0f +/- %.0f | "
+    log("eval at %llu iterations: LBR %.0f +/- %.0f mbb/hand | vs always-call %+.0f +/- %.0f | "
         "vs random %+.0f +/- %.0f  (%.0fs)",
-        iterations, l.mbb_per_hand, l.stderr_mbb, c.mbb_per_hand, c.stderr_mbb, r.mbb_per_hand,
+        ull(iterations), l.mbb_per_hand, l.stderr_mbb, c.mbb_per_hand, c.stderr_mbb, r.mbb_per_hand,
         r.stderr_mbb, minutes_since(t) * 60.0);
     metrics << minutes_since(start) << "," << iterations << "," << rate << "," << l.mbb_per_hand << ","
             << l.stderr_mbb << "," << c.mbb_per_hand << "," << c.stderr_mbb << "," << r.mbb_per_hand
@@ -317,6 +350,10 @@ int main(int argc, char** argv) {
   if (!args.resume) evaluate();  // baseline for the untrained strategy
 
   while (!g_stop) {
+    if (std::filesystem::exists(stop_path)) {
+      g_stop = true;
+      break;
+    }
     if (args.max_iterations && iterations >= args.max_iterations) break;
     if (minutes_since(start) >= args.hours * 60.0) break;
 
@@ -341,8 +378,8 @@ int main(int argc, char** argv) {
       const double k = static_cast<double>(epoch_index + 1);
       tables.scale(k / (k + 1.0), args.threads);
     }
-    log("epoch %lu: %lu iterations, %.0f it/s, %.0f training minutes%s%s", epoch_index + 1, iterations,
-        rate, trained_seconds / 60.0, opt.pruning ? ", pruning" : "", linear ? ", linear discount" : "");
+    log("epoch %llu: %llu iterations, %.0f it/s, %.0f training minutes%s%s", ull(epoch_index + 1),
+        ull(iterations), rate, trained_seconds / 60.0, opt.pruning ? ", pruning" : "", linear ? ", linear discount" : "");
 
     if (minutes_since(last_checkpoint) >= args.checkpoint_minutes) checkpoint();
     if (minutes_since(last_eval) >= args.eval_minutes) evaluate();

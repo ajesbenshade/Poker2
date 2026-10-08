@@ -180,7 +180,9 @@ inline Range br_values(const BettingTree& tree, const StrategyTables& tables, co
       for (uint64_t i = begin; i < end; ++i) {
         double sum = 0.0;
         for (int j = 0; j < kN; ++j) {
-          if (opp_reach[j] > 0.0 && !eq.overlap(i, j)) sum += opp_reach[j] * (2.0 * eq.equity(i, j) - 1.0);
+          if (opp_reach[j] > 0.0 && !eq.overlap(i, j)) {
+            sum += opp_reach[j] * (2.0 * eq.equity(static_cast<int>(i), j) - 1.0);
+          }
         }
         v[i] = sum * stake;
       }

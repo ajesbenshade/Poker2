@@ -26,14 +26,25 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for the full plan and current status.
   Linear CFR weighting, which is the algorithm the HUNL blueprint will use (`engine/src/cfr/`).
 - **Evaluation:** exact best response, exploitability and profile value (`engine/src/cfr/evaluation.h`).
 
-Build and test inside WSL (Ubuntu 24.04, g++ 13, C++20):
+The engine builds natively on Windows with Visual Studio (C++ workload, including the Windows SDK)
+and on Linux/WSL with g++ 13. Training runs natively on Windows: no WSL VM that the host can kill,
+and all 64 GB of RAM.
+
+Windows (outputs in `engine\build-win\`):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File engine\build.ps1 -Test
+```
+
+Linux/WSL (outputs in `engine/build/`):
 
 ```bash
 make -C engine test
 ```
 
-`make -C engine test-slow` adds the exhaustive checks: all 133,784,560 seven-card hands, every
-flop deal, and full turn and river isomorphism round trips (about 35 seconds).
+`poker2_tests --slow` (or `make -C engine test-slow`) adds the exhaustive checks: all 133,784,560
+seven-card hands, every flop deal, and full turn and river isomorphism round trips (35-45 seconds).
+The tool examples below use the Linux paths; on Windows the same tools are `engine\build-win\*.exe`.
 
 Size the blueprint's betting tree and memory, and benchmark the building blocks:
 
@@ -54,16 +65,23 @@ engine/build/poker2_abstraction
 It runs the stages `preflop,equity,river,turn,flop,report`; `--stages` reruns a subset, and
 `--buckets FLOP,TURN,RIVER` changes bucket counts.
 
-Train the blueprint. `engine/scripts/blueprint.sh` runs the full abstraction (~22.9 GB of tables)
-and `engine/scripts/pilot.sh` the 200-bucket pilot. From Windows, start either detached so it keeps
-running after the terminal closes:
+Train the blueprint (CPU only; the GPU is not used). On Windows, `engine\scripts\blueprint.ps1` runs
+the full abstraction (~22.9 GB of tables) detached from the terminal at below-normal priority,
+checkpointing every 30 minutes. It expects the abstraction in `%USERPROFILE%\poker2-data\abstraction`.
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File engine\scripts\start_run.ps1 -Script blueprint
+powershell -ExecutionPolicy Bypass -File engine\scripts\blueprint.ps1
 ```
 
-Progress goes to `~/poker2-runs/<script>/train.log` and `metrics.csv`. Stop cleanly with
-`pkill -TERM -x poker2_train` (it checkpoints first) and continue with `engine/scripts/blueprint.sh --resume`.
+Progress goes to `%USERPROFILE%\poker2-runs\blueprint\train.log` and `metrics.csv`. `-Stop` asks the
+run to finish its epoch, checkpoint and exit (it creates a `STOP` file in the run directory), and
+`-Resume` continues from the last checkpoint. Under WSL, `engine/scripts/blueprint.sh` and `pilot.sh`
+do the same (stop with `pkill -TERM -x poker2_train`).
+
+`engine\scripts\install_auto_resume.ps1` registers a scheduled task (at logon and every 15 minutes)
+that restarts the run from its last checkpoint if it died, e.g. after a Windows Update reboot. It
+leaves a run alone when `train.log` ends with "exiting normally" (finished, or stopped with `-Stop`).
+Decisions are logged to `auto_resume.log` in the run directory; `-Remove` deletes the task.
 
 Plot a convergence curve:
 

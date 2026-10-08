@@ -23,7 +23,7 @@ exec setsid --wait nice -n 10 "$ENGINE/build/poker2_train" \
   --epoch 50000000 \
   --linear-minutes 400 \
   --prune-after-minutes 200 \
-  --checkpoint-minutes 120 \
+  --checkpoint-minutes 30 \
   --eval-minutes 60 \
   --lbr-hands 100000 \
   --h2h-deals 50000 \

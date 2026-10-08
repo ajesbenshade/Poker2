@@ -132,11 +132,22 @@ The second pilot ran 3.85B iterations (6.5 hours) and LBR stayed flat at ~3,800 
 
 ## Full blueprint run
 
-`engine/scripts/blueprint.sh`: blueprint bet sizes, 169/2,000/2,000/1,500 buckets. Tables use float
-regrets, double preflop/flop averages and float turn/river averages: 22.9 GB, which fits the current
-30 GB WSL limit (all-double would be ~45 GB). The schedule is by training time, as in Pluribus:
-Linear CFR for 400 minutes, pruning after 200 minutes, since iteration-based schedules were missized
-twice. Checkpoints every 2 hours, LBR and baseline matches every hour.
+`engine/scripts/blueprint.ps1` (Windows) / `blueprint.sh` (WSL): blueprint bet sizes,
+169/2,000/2,000/1,500 buckets. Tables use float regrets, double preflop/flop averages and float
+turn/river averages: 22.9 GB (all-double would be ~45 GB). The schedule is by training time, as in
+Pluribus: Linear CFR for 400 minutes, pruning after 200 minutes, since iteration-based schedules were
+missized twice. Checkpoints every 30 minutes, LBR and baseline matches every hour.
+
+**First attempt lost (2026-09-25).** The run started in WSL at 12:27 and reached LBR 1,522 mbb/hand
+at 350M iterations, then died at 14:03 when the host terminated the whole WSL VM: a Hyper-V event at
+14:04 removes the VM's network adapter, and the Linux journal ends abruptly with no orderly shutdown.
+The cause on the Windows side is not recorded (a WSL service restart or update would do it). No
+checkpoint had been written yet (first was due at 14:27), so nothing survived. Changes since:
+training runs natively on Windows (no VM to lose, all 64 GB of RAM), checkpoints every 30 minutes
+instead of every 2 hours, and a `STOP` file gives detached Windows runs a clean stop.
+
+Blueprint training is CPU-only. The RTX 3080 is used only by the GPU search solvers, in short
+bursts; nothing in training depends on the 7900 XT that failed under the earlier Python trainer.
 
 ## Schedule
 
@@ -146,7 +157,7 @@ twice. Checkpoints every 2 hours, LBR and baseline matches every hour.
 | 3-6 | HUNL engine: rules, hand evaluator, isomorphism, action abstraction, tests | Evaluator and isomorphism match published counts exactly; random games replay correctly | **Done** |
 | 5-8 | Card abstraction (CPU equity, k-means clustering) | Bucket files written and quality-checked | **Done** |
 | 8-9 | 24-hour pilot with a small abstraction | Local-best-response exploitability falling | **Done**: trainer verified exactly; pilot hit the 200-bucket floor (LBR ~1,800) |
-| 9-27 | Full blueprint run (~18 days x 24 threads) | Checkpoint every 2 h, evaluated every hour | **Running** (started 2026-09-25) |
+| 9-27 | Full blueprint run (~18 days x 24 threads) | Checkpoint every 30 min, evaluated every hour | First attempt lost to a WSL VM kill (2026-09-25); restarting natively on Windows |
 | 12-25 | Real-time search and value network | Search beats the blueprint alone head-to-head | |
 | 27-30 | Final evaluation vs Slumbot, 20k+ hands with AIVAT | Checkpoint chosen by exploitability and head-to-head, never by average utility | |
 

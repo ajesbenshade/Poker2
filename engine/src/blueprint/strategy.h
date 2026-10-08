@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -76,6 +77,47 @@ struct TableLayout {
       total += entries * (sizeof(float) + average_bytes(s));
     }
     return total;
+  }
+};
+
+// Checkpoint file header, shared by StrategyTables and CheckpointReader.
+// After it, for each street 0..3: float regrets, then double averages, then
+// float averages (each array present only when that street stores it).
+struct CheckpointHeader {
+  char magic[8];
+  uint32_t version;
+  uint32_t pad;
+  uint64_t iterations;
+  uint64_t num_nodes;
+  uint64_t num_terminals;
+  uint64_t street_slots[4];
+  int32_t buckets[4];
+  uint8_t average_bytes[4];  // per street: 0 (none), 4 (float), 8 (double); regrets are float
+  uint32_t pad2;
+
+  // The header a checkpoint for this tree and layout must have.
+  static CheckpointHeader expected(const BettingTree& tree, const TableLayout& layout, uint64_t iterations) {
+    CheckpointHeader h{};
+    std::memcpy(h.magic, "P2BLUEP", 8);
+    h.version = 3;
+    h.iterations = iterations;
+    h.num_nodes = tree.num_nodes();
+    h.num_terminals = tree.num_terminals();
+    for (int s = 0; s < 4; ++s) {
+      h.street_slots[s] = tree.street_slots(s);
+      h.buckets[s] = layout.buckets[s];
+      h.average_bytes[s] = static_cast<uint8_t>(s <= tree.max_street() ? layout.average_bytes(s) : 0);
+    }
+    return h;
+  }
+
+  // Same tree, layout and precision (ignores the iteration count).
+  bool matches(const CheckpointHeader& o) const {
+    return std::memcmp(magic, o.magic, 8) == 0 && version == o.version && num_nodes == o.num_nodes &&
+           num_terminals == o.num_terminals &&
+           std::memcmp(street_slots, o.street_slots, sizeof(street_slots)) == 0 &&
+           std::memcmp(buckets, o.buckets, sizeof(buckets)) == 0 &&
+           std::memcmp(average_bytes, o.average_bytes, sizeof(average_bytes)) == 0;
   }
 };
 
@@ -172,13 +214,15 @@ class StrategyTables {
     const std::string tmp = path + ".tmp";
     FILE* f = std::fopen(tmp.c_str(), "wb");
     if (!f) throw std::runtime_error("cannot write " + tmp);
-    Header h = header(iterations);
+    const CheckpointHeader h = CheckpointHeader::expected(tree_, layout_, iterations);
     bool ok = std::fwrite(&h, sizeof(h), 1, f) == 1;
     for (int s = 0; s < 4 && ok; ++s) {
       ok = write_all(f, regret_[s]) && write_all(f, average_d_[s]) && write_all(f, average_f_[s]);
     }
     if (std::fclose(f) != 0 || !ok) throw std::runtime_error("write failed: " + tmp);
-    if (std::rename(tmp.c_str(), path.c_str()) != 0) throw std::runtime_error("rename failed: " + path);
+    // std::filesystem::rename replaces an existing file on every platform (std::rename
+    // fails on Windows when the target exists).
+    std::filesystem::rename(tmp, path);
   }
 
   // Returns the saved iteration count. Throws if the file was written for a
@@ -186,14 +230,9 @@ class StrategyTables {
   uint64_t load(const std::string& path) {
     FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) throw std::runtime_error("cannot open " + path);
-    Header saved{};
-    const Header expected = header(0);
+    CheckpointHeader saved{};
     bool ok = std::fread(&saved, sizeof(saved), 1, f) == 1;
-    if (!ok || std::memcmp(saved.magic, expected.magic, 8) != 0 || saved.version != expected.version ||
-        saved.num_nodes != expected.num_nodes || saved.num_terminals != expected.num_terminals ||
-        std::memcmp(saved.street_slots, expected.street_slots, sizeof(saved.street_slots)) != 0 ||
-        std::memcmp(saved.buckets, expected.buckets, sizeof(saved.buckets)) != 0 ||
-        std::memcmp(saved.average_bytes, expected.average_bytes, sizeof(saved.average_bytes)) != 0) {
+    if (!ok || !saved.matches(CheckpointHeader::expected(tree_, layout_, 0))) {
       std::fclose(f);
       throw std::runtime_error("checkpoint does not match this tree, layout and precision: " + path);
     }
@@ -210,34 +249,6 @@ class StrategyTables {
   }
 
  private:
-  struct Header {
-    char magic[8];
-    uint32_t version;
-    uint32_t pad;
-    uint64_t iterations;
-    uint64_t num_nodes;
-    uint64_t num_terminals;
-    uint64_t street_slots[4];
-    int32_t buckets[4];
-    uint8_t average_bytes[4];  // per street: 0 (none), 4 (float), 8 (double); regrets are float
-    uint32_t pad2;
-  };
-
-  Header header(uint64_t iterations) const {
-    Header h{};
-    std::memcpy(h.magic, "P2BLUEP", 8);
-    h.version = 3;
-    h.iterations = iterations;
-    h.num_nodes = tree_.num_nodes();
-    h.num_terminals = tree_.num_terminals();
-    for (int s = 0; s < 4; ++s) {
-      h.street_slots[s] = tree_.street_slots(s);
-      h.buckets[s] = layout_.buckets[s];
-      h.average_bytes[s] = static_cast<uint8_t>(!average_d_[s].empty() ? 8 : (!average_f_[s].empty() ? 4 : 0));
-    }
-    return h;
-  }
-
   template <class T>
   static bool write_all(FILE* f, const std::vector<T>& v) {
     return v.empty() || std::fwrite(v.data(), sizeof(T), v.size(), f) == v.size();

@@ -53,10 +53,11 @@ inline DealView view_deal(const holdem::Deal& deal, const abstraction::CardAbstr
   return v;
 }
 
+// Chip counts (at most the 20,000 stack) are exact in float.
 inline float terminal_value(const TerminalNode& t, const DealView& v, int player) {
-  if (t.folder >= 0) return t.folder == player ? -t.contrib[player] : t.contrib[t.folder];
-  if (v.strength[player] > v.strength[1 - player]) return t.contrib[1 - player];
-  if (v.strength[player] < v.strength[1 - player]) return -t.contrib[player];
+  if (t.folder >= 0) return static_cast<float>(t.folder == player ? -t.contrib[player] : t.contrib[t.folder]);
+  if (v.strength[player] > v.strength[1 - player]) return static_cast<float>(t.contrib[1 - player]);
+  if (v.strength[player] < v.strength[1 - player]) return static_cast<float>(-t.contrib[player]);
   return 0.0f;
 }
 

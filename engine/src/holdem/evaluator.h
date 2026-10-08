@@ -8,6 +8,7 @@
 // Flush is checked before quads and full house because neither can coexist
 // with a flush in 7 or fewer cards.
 
+#include <bit>
 #include <cstdint>
 
 #include "holdem/cards.h"
@@ -36,7 +37,7 @@ inline HandCategory category_of(uint32_t strength) {
 
 namespace detail {
 
-inline int highest_bit(uint32_t mask) { return 31 - __builtin_clz(mask); }
+inline int highest_bit(uint32_t mask) { return 31 - std::countl_zero(mask); }
 
 // Packs the top `count` ranks of `mask` (highest first) starting at nibble `slot`.
 inline uint32_t pack_top(uint32_t mask, int count, int slot) {
@@ -69,7 +70,7 @@ inline uint32_t evaluate(const Card* cards, int n) {
   for (int i = 0; i < n; ++i) suit_mask[suit_of(cards[i])] |= 1u << rank_of(cards[i]);
 
   for (uint32_t m : suit_mask) {
-    if (__builtin_popcount(m) >= 5) {
+    if (std::popcount(m) >= 5) {
       const int high = straight_high(m);
       if (high >= 0) return make_strength(kStraightFlush, static_cast<uint32_t>(high) << 16);
       return make_strength(kFlush, pack_top(m, 5, 4));
@@ -93,7 +94,7 @@ inline uint32_t evaluate(const Card* cards, int n) {
 
   const uint32_t trips = threes;          // exactly three (no quads here)
   const uint32_t pairs = twos & ~threes;  // exactly two
-  if (trips && (__builtin_popcount(trips) >= 2 || pairs)) {
+  if (trips && (std::popcount(trips) >= 2 || pairs)) {
     const int trip = highest_bit(trips);
     const int pair = highest_bit((trips & ~(1u << trip)) | pairs);
     return make_strength(kFullHouse,
@@ -109,7 +110,7 @@ inline uint32_t evaluate(const Card* cards, int n) {
                                      pack_top(ones & ~(1u << trip), 2, 3));
   }
 
-  if (__builtin_popcount(pairs) >= 2) {
+  if (std::popcount(pairs) >= 2) {
     const int p1 = highest_bit(pairs);
     const int p2 = highest_bit(pairs & ~(1u << p1));
     const uint32_t kicker_mask = ones & ~(1u << p1) & ~(1u << p2);
